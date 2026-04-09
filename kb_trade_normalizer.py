@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import bisect
@@ -100,19 +99,20 @@ def parse_date_safe(val) -> Optional[date]:
 def extract_account_info(a1_value: str) -> Tuple[str, str]:
     text = clean_text(a1_value)
 
-    # 1️⃣ 하이픈 포함 계좌번호 우선
+    # 1) 하이픈 포함 계좌번호 우선
     m = re.search(r"(\d+(?:-\d+)+)", text)
     if m:
         account_no = m.group(1)
         holder = text[m.end():].strip()
         return account_no, holder
 
-    # 2️⃣ fallback (숫자만 있는 경우)
+    # 2) fallback (숫자만 있는 경우)
     m2 = re.search(r"(\d{8,})", text)
     account_no = m2.group(1) if m2 else ""
     holder = re.sub(r"^[\d\-\s]+", "", text).strip()
 
     return account_no, holder
+
 
 def find_exchange_dir(base_dir: Path) -> Optional[Path]:
     for name in EXCHANGE_DIR_NAMES:
@@ -231,12 +231,12 @@ def calculate_row(
     qty = to_decimal(row.get("수량"))
     trade_amount = to_decimal(row.get("거래금액"))
     settle_amount = to_decimal(row.get("정산금액"))
+    fx_settle_amount = to_decimal(row.get("외화정산금액"))
     unit_price = to_decimal(row.get("단가"))
     fee_domestic = to_decimal(row.get("수수료"))
     fee_foreign = to_decimal(row.get("국외수수료"))
     fx = get_effective_rate(row, fx_tables)
     delta_fx_cash = foreign_cash_delta(row, prev_row)
-    delta_fx_abs = abs(delta_fx_cash)
 
     # 1) 매수 / 매도 (해외주식)
     if tx in {"매수", "매도"}:
@@ -247,7 +247,7 @@ def calculate_row(
         out_tax = to_decimal(row.get("거래세 등")) * fx
         return out_qty, out_unit, out_amount, out_fee, out_tax, ""
 
-    # 2) 주식장내매도 / 주식장내매수 (국내주식)
+    # 2) 주식장내매수 / 주식장내매도 (국내주식)
     if tx in {"주식장내매수", "주식장내매도"}:
         out_qty = qty
         out_unit = unit_price
@@ -258,7 +258,7 @@ def calculate_row(
 
     # 3) 외화매수 / 외화매도
     if tx in {"외화매수", "외화매도"}:
-        out_qty = settle_amount
+        out_qty = fx_settle_amount
         out_unit = fx
         out_amount = out_qty * out_unit
         out_fee = fee_domestic
@@ -268,6 +268,7 @@ def calculate_row(
             + to_decimal(row.get("양도세"))
         )
         return out_qty, out_unit, out_amount, out_fee, out_tax, ""
+
     # 4) 배당금 입금
     if tx == "배당금 입금":
         currency = clean_text(row.get("통화구분")).upper()
@@ -278,7 +279,7 @@ def calculate_row(
             + to_decimal(row.get("양도세"))
         )
 
-        # 통화구분이 비어있는 경우
+        # 통화구분이 없는 경우
         if currency == "":
             out_qty = Decimal("0")
             out_unit = Decimal("0")
@@ -286,27 +287,19 @@ def calculate_row(
             return out_qty, out_unit, out_amount, out_fee, out_tax, ""
 
         # 통화구분이 있는 경우
-        out_qty = delta_fx_abs
+        out_qty = fx_settle_amount
         out_unit = fx
         out_amount = out_qty * out_unit
-
-        note = ""
-        if out_qty == 0:
-            note = "외화예수금 차이로 배당 외화정산수량을 찾지 못했습니다."
-
-        return out_qty, out_unit, out_amount, out_fee, out_tax, note
+        return out_qty, out_unit, out_amount, out_fee, out_tax, ""
 
     # 5) 해외원천세 출금
     if tx == "해외원천세 출금":
-        out_qty = delta_fx_abs
+        out_qty = fx_settle_amount
         out_unit = fx
         out_amount = Decimal("0")
         out_fee = Decimal("0")
         out_tax = out_qty * out_unit
-        note = ""
-        if out_qty == 0:
-            note = "외화예수금 차이로 해외원천세 외화정산수량을 찾지 못했습니다."
-        return out_qty, out_unit, out_amount, out_fee, out_tax, note
+        return out_qty, out_unit, out_amount, out_fee, out_tax, ""
 
     # 6) 예탁금이용료 입금
     if tx == "예탁금이용료 입금":
@@ -367,8 +360,8 @@ def calculate_row(
         out_tax = Decimal("0")
         return out_qty, out_unit, out_amount, out_fee, out_tax, ""
 
-    # 11) 대체 입고
-    if tx == "대체 입고":
+    # 11) 대체 입고 / 대체입고
+    if tx in {"대체 입고", "대체입고"}:
         out_qty = qty
         out_unit = Decimal("0")
         out_amount = Decimal("0")
@@ -405,14 +398,28 @@ def read_sheet_rows(ws, fx_tables: Dict[str, ExchangeTable]) -> Tuple[List[List]
     account_no, holder = extract_account_info(ws["A1"].value)
 
     header_row_idx = 3
-    headers = [ws.cell(header_row_idx, col).value for col in range(1, 26)]
+    headers = [ws.cell(header_row_idx, col).value for col in range(1, 40)]
     header_map = {clean_text(v): idx + 1 for idx, v in enumerate(headers) if v not in (None, "")}
 
     required_headers = [
-        "거래일자", "거래종류", "수량", "거래금액", "정산금액",
-        "거래세 등", "소득세", "양도세", "통화구분", "환율",
-        "국외수수료", "종목명", "단가", "수수료", "농특세/부가세",
-        "지방소득세", "외화예수금",
+        "거래일자",
+        "거래종류",
+        "수량",
+        "거래금액",
+        "정산금액",
+        "외화정산금액",
+        "거래세 등",
+        "소득세",
+        "양도세",
+        "통화구분",
+        "환율",
+        "국외수수료",
+        "종목명",
+        "단가",
+        "수수료",
+        "농특세/부가세",
+        "지방소득세",
+        "외화예수금",
     ]
     for key in required_headers:
         if key not in header_map:
