@@ -99,10 +99,20 @@ def parse_date_safe(val) -> Optional[date]:
 
 def extract_account_info(a1_value: str) -> Tuple[str, str]:
     text = clean_text(a1_value)
-    account_no = "".join(re.findall(r"\d", text))
-    holder = re.sub(r"^[\d\-\s]+", "", text).strip()
-    return account_no, holder
 
+    # 1️⃣ 하이픈 포함 계좌번호 우선
+    m = re.search(r"(\d+(?:-\d+)+)", text)
+    if m:
+        account_no = m.group(1)
+        holder = text[m.end():].strip()
+        return account_no, holder
+
+    # 2️⃣ fallback (숫자만 있는 경우)
+    m2 = re.search(r"(\d{8,})", text)
+    account_no = m2.group(1) if m2 else ""
+    holder = re.sub(r"^[\d\-\s]+", "", text).strip()
+
+    return account_no, holder
 
 def find_exchange_dir(base_dir: Path) -> Optional[Path]:
     for name in EXCHANGE_DIR_NAMES:
@@ -248,7 +258,7 @@ def calculate_row(
 
     # 3) 외화매수 / 외화매도
     if tx in {"외화매수", "외화매도"}:
-        out_qty = delta_fx_abs
+        out_qty = settle_amount
         out_unit = fx
         out_amount = out_qty * out_unit
         out_fee = fee_domestic
@@ -257,11 +267,7 @@ def calculate_row(
             + to_decimal(row.get("소득세"))
             + to_decimal(row.get("양도세"))
         )
-        note = ""
-        if out_qty == 0 and settle_amount != 0:
-            note = "외화예수금 변동이 0이라 외화정산수량을 0으로 계산했습니다."
-        return out_qty, out_unit, out_amount, out_fee, out_tax, note
-
+        return out_qty, out_unit, out_amount, out_fee, out_tax, ""
     # 4) 배당금 입금
     if tx == "배당금 입금":
         currency = clean_text(row.get("통화구분")).upper()
