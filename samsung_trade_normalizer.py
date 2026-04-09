@@ -128,11 +128,25 @@ def clean_text(value) -> str:
 
 def extract_account_info(a1_value: str) -> Tuple[str, str]:
     text = clean_text(a1_value)
-    account_no = "".join(re.findall(r"\d", text))
-    m = re.search(r"\]\s*(.+)$", text)
-    holder = m.group(1).strip() if m else ""
-    return account_no, holder
 
+    # 1️⃣ 하이픈 포함 계좌번호 우선
+    m_no = re.search(r"(\d+(?:-\d+)+)", text)
+    if m_no:
+        account_no = m_no.group(1)
+    else:
+        m2 = re.search(r"(\d{8,})", text)
+        account_no = m2.group(1) if m2 else ""
+
+    # 계약자명
+    m_holder = re.search(r"\]\s*(.+)$", text)
+    if m_holder:
+        holder = m_holder.group(1).strip()
+    elif m_no:
+        holder = text[m_no.end():].strip()
+    else:
+        holder = ""
+
+    return account_no, holder
 
 def find_exchange_dir(base_dir: Path) -> Optional[Path]:
     for name in EXCHANGE_DIR_NAMES:
