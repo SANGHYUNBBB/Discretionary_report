@@ -314,13 +314,37 @@ def calculate_row(row: dict, fx_tables: Dict[str, ExchangeTable]) -> Tuple[Optio
         return [out_qty, out_unit, out_amount, out_fee, out_tax], ""
 
     # 사용자가 지정한 원화 환전류 + 실제 파일에서 나온 외화 환전류 함께 반영
+# 외화출금(환전): 통화구분이 외화면 거래금액 * 환율
+    if tx == "외화출금(환전)" and currency not in ("", "KRW"):
+        out_qty = Decimal("0")
+        out_unit = Decimal("0")
+        out_amount = amount * fx
+        out_fee = fee * fx
+        out_tax = tax * fx
+        return [out_qty, out_unit, out_amount, out_fee, out_tax], ""
+    
+    if tx == "외화입금(환전)" and currency not in ("", "KRW"):
+        out_qty = Decimal("0")
+        out_unit = Decimal("0")
+        out_amount = amount * fx
+        out_fee = fee * fx
+        out_tax = tax * fx
+        return [out_qty, out_unit, out_amount, out_fee, out_tax], ""
+    
+    if tx == "외화입금(증거금환전)" and currency not in ("", "KRW"):
+        out_qty = Decimal("0")
+        out_unit = Decimal("0")
+        out_amount = amount * fx
+        out_fee = fee * fx
+        out_tax = tax * fx
+        return [out_qty, out_unit, out_amount, out_fee, out_tax], ""
+
+    # 원화 환전류 + 외화입금(증거금환전)
     if tx in {
         "원화입금(환전)",
         "원화출금(환전)",
         "원화출금(증거금환전)",
         "원화입금(증거금환전)",
-        "외화출금(환전)",
-        "외화입금(증거금환전)",
     }:
         out_qty = Decimal("0")
         out_unit = Decimal("0")

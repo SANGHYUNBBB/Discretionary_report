@@ -255,10 +255,12 @@ def calculate_row(row: dict, fx_tables: Dict[str, ExchangeTable]) -> Tuple[Decim
     if tx == "예탁금이용료":
         out_qty = Decimal("0")
         out_unit = Decimal("0")
-        out_amount = Decimal("0")
+        out_amount = trade_amount 
         out_fee = fee
         out_tax = tax_sum_raw(row)
         return out_qty, out_unit, out_amount, out_fee, out_tax, ""
+
+
 
     if tx == "외화실시간직접매도환전":
         out_qty = trade_amount
