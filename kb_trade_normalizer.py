@@ -303,9 +303,9 @@ def calculate_row(
 
     # 6) 예탁금이용료 입금
     if tx == "예탁금이용료 입금":
+        currency = clean_text(row.get("통화구분")).upper()
         out_qty = Decimal("0")
         out_unit = Decimal("0")
-        out_amount = trade_amount
         out_fee = Decimal("0")
         out_tax = (
             to_decimal(row.get("농특세/부가세"))
@@ -313,8 +313,16 @@ def calculate_row(
             + to_decimal(row.get("소득세"))
             + to_decimal(row.get("양도세"))
         )
-        return out_qty, out_unit, out_amount, out_fee, out_tax, ""
 
+        # 외화 예탁금이용료 입금
+        if currency not in ("", "KRW"):
+            out_amount = fx_settle_amount * fx
+            return out_qty, out_unit, out_amount, out_fee, out_tax, ""
+
+        # 원화 예탁금이용료 입금
+        out_amount = trade_amount if trade_amount != 0 else settle_amount
+        return out_qty, out_unit, out_amount, out_fee, out_tax, ""
+    
     # 7) 이자소득세추징 출금
     if tx == "이자소득세추징 출금":
         out_qty = Decimal("0")
