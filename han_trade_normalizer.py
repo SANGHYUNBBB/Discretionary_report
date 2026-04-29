@@ -171,6 +171,12 @@ def get_effective_rate(row: dict, fx_tables: Dict[str, ExchangeTable]) -> Decima
     if currency in ("", "KRW"):
         return Decimal("1")
 
+    # 1순위: 원본 환율 열
+    raw_fx = to_decimal(row.get("환율"))
+    if raw_fx != Decimal("0"):
+        return adjust_fx_rate(currency, raw_fx)
+
+    # 2순위: exchange_rate 폴더 환율
     trade_date = parse_date_safe(row.get("거래일"))
     if trade_date is None:
         raise ValueError("거래일을 해석할 수 없습니다.")
@@ -178,7 +184,9 @@ def get_effective_rate(row: dict, fx_tables: Dict[str, ExchangeTable]) -> Decima
     table = fx_tables.get(currency)
     if table is None:
         available = ", ".join(sorted(fx_tables.keys())) if fx_tables else "없음"
-        raise KeyError(f"통화코드 {currency} 에 해당하는 환율 파일을 찾지 못했습니다. 사용가능 코드: {available}")
+        raise KeyError(
+            f"통화코드 {currency} 에 해당하는 환율 파일을 찾지 못했습니다. 사용가능 코드: {available}"
+        )
 
     fx = table.lookup(trade_date)
     return adjust_fx_rate(currency, fx)
@@ -346,7 +354,7 @@ def read_sheet_rows(ws, fx_tables: Dict[str, ExchangeTable]) -> Tuple[List[List]
     required_headers = [
         "계좌번호", "계좌명", "거래일", "거래종류_텍스트",
         "종목명", "거래수량", "거래단가", "거래금액", "수수료",
-        "거래세", "세금", "부가세"
+        "거래세", "세금", "부가세", "환율"
     ]
     for key in required_headers:
         if key not in header_map:

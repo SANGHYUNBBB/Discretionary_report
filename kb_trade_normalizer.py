@@ -258,9 +258,15 @@ def calculate_row(
 
     # 3) 외화매수 / 외화매도
     if tx in {"외화매수", "외화매도"}:
+        # KB 원본의 환율 열을 그대로 사용
+        raw_fx = to_decimal(row.get("환율"))
+        currency = clean_text(row.get("통화구분")).upper()
+        if currency == "JPY":
+            raw_fx = raw_fx / Decimal("100")
+
         out_qty = fx_settle_amount
-        out_unit = fx
-        out_amount = out_qty * out_unit
+        out_unit = raw_fx
+        out_amount = settle_amount
         out_fee = fee_domestic
         out_tax = (
             to_decimal(row.get("거래세 등"))
@@ -333,8 +339,8 @@ def calculate_row(
     if tx == "비용충당외화매수 출금":
         out_qty = Decimal("0")
         out_unit = Decimal("0")
-        out_amount = settle_amount
-        out_fee = Decimal("0")
+        out_amount = Decimal("0")
+        out_fee = settle_amount
         out_tax = Decimal("0")
         return out_qty, out_unit, out_amount, out_fee, out_tax, ""
 
