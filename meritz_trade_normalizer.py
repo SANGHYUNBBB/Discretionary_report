@@ -45,6 +45,7 @@ HEADER_ALIASES = {
     "매매금액(외화)": ["매매금액(외화)", "거래금액(외화)", "금액(외화)", "외화금액"],
     "수수료(외화)": ["수수료(외화)", "외화수수료", "수수료외화"],
     "제비용(외화)": ["제비용(외화)", "외화제비용", "제비용외화"],
+    "기준환율": ["기준환율", "환율", "적용환율"],
 }
 
 
@@ -204,9 +205,13 @@ def get_fx_rate(row: dict, fx_tables: Dict[str, ExchangeTable]) -> Decimal:
     if currency in ("", "KRW"):
         return Decimal("1")
 
-    order_date = parse_date_safe(row.get("주문일자"))
+    # 1) 원본의 기준환율 우선 사용
+    base_fx = to_decimal(row.get("기준환율"))
+    if base_fx != Decimal("0"):
+        return adjust_fx_rate(currency, base_fx)
 
-    # 주문일자가 없으면 거래일자로 fallback
+    # 2) 기준환율이 비어 있으면 주문일자 기준 환율 테이블 사용
+    order_date = parse_date_safe(row.get("주문일자"))
     if order_date is None:
         order_date = parse_date_safe(row.get("거래일자"))
 
@@ -216,7 +221,9 @@ def get_fx_rate(row: dict, fx_tables: Dict[str, ExchangeTable]) -> Decimal:
     table = fx_tables.get(currency)
     if table is None:
         available = ", ".join(sorted(fx_tables.keys())) if fx_tables else "없음"
-        raise KeyError(f"통화코드 {currency} 에 해당하는 환율 파일을 찾지 못했습니다. 사용가능 코드: {available}")
+        raise KeyError(
+            f"통화코드 {currency} 에 해당하는 환율 파일을 찾지 못했습니다. 사용가능 코드: {available}"
+        )
 
     fx = table.lookup(order_date)
     return adjust_fx_rate(currency, fx)
