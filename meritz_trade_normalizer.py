@@ -14,8 +14,8 @@ from openpyxl.utils import get_column_letter
 
 BASE_DIR = Path.cwd()
 INPUT_PATTERNS = [
-    "meritz26q1.xlsx",
-    "MERITZ26q1.xlsx",
+    "meritz26q2.xlsx",
+    "MERITZ26q2.xlsx",
     "메리츠증권*.xlsx",
     "메리츠증권*.xlsm",
 ]
