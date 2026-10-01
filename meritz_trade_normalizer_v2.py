@@ -12,11 +12,10 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 try:
     import xlrd
-except ImportError as exc:
-    raise ImportError(
-        "메리츠 원본이 .xls 형식이므로 xlrd가 필요합니다. "
-        "명령 프롬프트에서 'pip install xlrd'를 실행한 뒤 다시 실행해 주세요."
-    ) from exc
+except ImportError:
+    # xlsx/xlsm 파일만 처리할 때는 xlrd가 필요하지 않다.
+    # 실제 입력 파일이 xls일 때 read_xls_file에서 안내한다.
+    xlrd = None
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
@@ -40,6 +39,9 @@ INPUT_PATTERNS = [
     "메리츠증권*.xls",
     "메리츠증권*.xlsx",
     "메리츠증권*.xlsm",
+    "메리츠*.xls",
+    "메리츠*.xlsx",
+    "메리츠*.xlsm",
 ]
 
 EXCHANGE_DIR_NAMES = [
@@ -135,6 +137,10 @@ HEADER_ALIASES = {
         "거래금액(외화)",
         "외화금액",
     },
+    "반영금액": {
+        "반영금액",
+        "반영 금액",
+    },
     "수수료": {
         "수수료",
         "수수료금액",
@@ -159,6 +165,7 @@ REQUIRED_HEADERS = [
     "거래수량",
     "거래단가",
     "거래금액",
+    "반영금액",
     "수수료",
     "제세금",
 ]
@@ -440,55 +447,43 @@ def load_exchange_rates(
     exchange_dir: Optional[Path],
 ) -> Dict[str, ExchangeTable]:
     """
-    exchange_rate 폴더의 xlsx/xlsm 파일을 읽는다.
+    exchange_rate 폴더에서 통화코드와 파일명이 정확히 같은
+    xlsx 파일만 읽는다.
 
-    - 파일명은 통화구분과 동일한 이름을 우선 사용한다.
-    - 첫 번째 시트의 A열 날짜, C열 환율을 읽는다.
-    - 날짜가 있는 모든 행을 읽으므로 시작 행이 바뀌어도 처리된다.
+    예:
+    - 통화구분 USD -> exchange_rate/USD.xlsx
+    - 통화구분 JPY -> exchange_rate/JPY.xlsx
+
+    환율 파일:
+    - 첫 번째 시트
+    - A열: 날짜
+    - C열: 환율
+    - 같은 날짜가 없으면 ExchangeTable.lookup에서 가장 가까운 이전 날짜 사용
     """
     rate_map: Dict[str, ExchangeTable] = {}
 
     if exchange_dir is None:
         return rate_map
 
-    candidate_files: List[Path] = []
-
-    for extension in (
-        "*.xlsx",
-        "*.xlsm",
-    ):
-        candidate_files.extend(
-            exchange_dir.glob(extension)
-        )
-
-        candidate_files.extend(
-            exchange_dir.glob(
-                f"**/{extension}"
-            )
-        )
-
-    seen_paths = set()
+    # 하위 폴더도 허용하되, 파일명은 통화코드와 정확히 같아야 한다.
+    candidate_files = sorted(
+        (
+            file_path
+            for file_path in exchange_dir.rglob("*.xlsx")
+            if not file_path.name.startswith("~$")
+            and file_path.stem.strip().upper() in FOREIGN_CODES
+        ),
+        key=lambda path: (
+            len(path.relative_to(exchange_dir).parts),
+            str(path).lower(),
+        ),
+    )
 
     for file_path in candidate_files:
-        resolved_path = str(
-            file_path.resolve()
-        )
+        currency_code = file_path.stem.strip().upper()
 
-        if resolved_path in seen_paths:
-            continue
-
-        if file_path.name.startswith("~$"):
-            continue
-
-        seen_paths.add(resolved_path)
-
-        currency_code = (
-            extract_currency_code_from_filename(
-                file_path
-            )
-        )
-
-        if currency_code not in FOREIGN_CODES:
+        # 같은 통화 파일이 여러 개면 exchange_rate 바로 아래 파일을 우선한다.
+        if currency_code in rate_map:
             continue
 
         workbook = load_workbook(
@@ -546,20 +541,24 @@ def load_exchange_rates(
                 f"찾지 못했습니다: {file_path}"
             )
 
-        date_rate_pairs.sort(
-            key=lambda item: item[0]
+        # 동일 날짜가 중복되면 파일에서 마지막으로 나온 값을 사용한다.
+        latest_by_date: Dict[int, Decimal] = {}
+        for ordinal, rate in date_rate_pairs:
+            latest_by_date[ordinal] = rate
+
+        sorted_pairs = sorted(
+            latest_by_date.items(),
+            key=lambda item: item[0],
         )
 
-        rate_map[
-            currency_code
-        ] = ExchangeTable(
+        rate_map[currency_code] = ExchangeTable(
             dates_ord=[
                 item[0]
-                for item in date_rate_pairs
+                for item in sorted_pairs
             ],
             rates=[
                 item[1]
-                for item in date_rate_pairs
+                for item in sorted_pairs
             ],
         )
 
@@ -745,6 +744,10 @@ def calculate_row(
         row.get("거래금액")
     )
 
+    reflected_amount = to_decimal(
+        row.get("반영금액")
+    )
+
     fee = to_decimal(
         row.get("수수료")
     )
@@ -811,6 +814,7 @@ def calculate_row(
 
     # ========================================================
     # 환전외화매도(자체) / 환전외화매수(자체)
+    # 수량=거래금액, 단가=환율, 매매금액=반영금액
     # ========================================================
     if transaction in {
         "환전외화매도(자체)",
@@ -826,7 +830,7 @@ def calculate_row(
         return [
             output_quantity,
             exchange_rate,
-            output_quantity * exchange_rate,
+            reflected_amount,
             fee * exchange_rate,
             tax * exchange_rate,
         ], ""
@@ -980,6 +984,12 @@ def read_xls_file(
     input_file: Path,
     fx_tables: Dict[str, ExchangeTable],
 ) -> Tuple[List[List], List[str]]:
+    if xlrd is None:
+        raise ImportError(
+            "메리츠 원본이 .xls 형식이므로 xlrd가 필요합니다. "
+            "명령 프롬프트에서 'pip install xlrd'를 실행한 뒤 다시 실행해 주세요."
+        )
+
     workbook = xlrd.open_workbook(
         str(input_file)
     )

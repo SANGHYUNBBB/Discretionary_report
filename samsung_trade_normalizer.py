@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+# 삼성증권 거래내역 정리
+# - 원본 파일에는 환율 열이 없으므로 환율이 필요한 거래는 모두
+#   exchange_rate 폴더에서 통화코드와 거래일자로 조회한다.
+# - 동일 날짜가 없으면 가장 가까운 이전 날짜를 사용한다.
+# - JPY 환율 파일은 100엔당 환율이므로 조회 후 100으로 나눈다.
+
 import bisect
 import os
 import re
@@ -73,7 +79,6 @@ DOMESTIC_STOCK_TYPES = {
 
 CASH_TRANSFER_TYPES = {
     "이체입금",
-    "이체출금",
     "대체입금",
     "대체출금",
     "출금",
@@ -81,7 +86,7 @@ CASH_TRANSFER_TYPES = {
 
 SUPPORT_BONUS_TYPES = {
     "투자지원금",
-    "투자지원금 입금",
+    "투자지원금입금",
 }
 
 
@@ -123,6 +128,20 @@ def clean_text(value) -> str:
         return ""
 
     return str(value).strip()
+
+
+def normalize_transaction(value) -> str:
+    """
+    거래명의 모든 공백을 제거해 비교한다.
+
+    예:
+    투자지원금 입금 -> 투자지원금입금
+    """
+    return re.sub(
+        r"\s+",
+        "",
+        clean_text(value),
+    )
 
 
 def safe_excel_text(value) -> str:
@@ -589,8 +608,12 @@ def calculate_row(
     각종세금,
     검토메시지
     """
-    transaction_name = clean_text(
+    transaction_original = clean_text(
         row.get("거래명")
+    )
+
+    transaction_name = normalize_transaction(
+        transaction_original
     )
 
     currency_code = clean_text(
@@ -671,22 +694,31 @@ def calculate_row(
         transaction_name,
         currency_code,
     ):
+        # 삼성증권 원본에는 환율 열이 없으므로 거래일과 통화코드로
+        # exchange_rate 폴더에서 환율을 조회한다.
+        # JPY는 get_fx_rate()에서 100엔당 환율을 1엔당 환율로 변환한다.
         exchange_rate = get_fx_rate(
             row,
             fx_tables,
         )
 
-        converted_unit_price = (
-            unit_price
-            * exchange_rate
-        )
+        # 외국주식 매수·매도 적용 규칙
+        # 수량               = 거래수량
+        # 매매단가           = 거래단가 × 환율
+        # 매매금액           = 외화거래금액 × 환율
+        # 위탁매매수수료     = 외화수수료 × 환율
+        # 각종세금           = 제세금/대출이자 × 환율
+        output_unit_price = unit_price * exchange_rate
+        output_trade_amount = foreign_trade_amount * exchange_rate
+        output_fee = foreign_fee * exchange_rate
+        output_tax = tax_fee * exchange_rate
 
         return (
             quantity,
-            converted_unit_price,
-            quantity * converted_unit_price,
-            foreign_fee * exchange_rate,
-            tax_fee * exchange_rate,
+            output_unit_price,
+            output_trade_amount,
+            output_fee,
+            output_tax,
             "",
         )
 
@@ -771,7 +803,27 @@ def calculate_row(
         )
 
     # ========================================================
-    # 이체입금 / 이체출금 / 대체입금 / 대체출금 / 출금
+    # 이체출금
+    # ========================================================
+    # 수량: 거래수량
+    # 매매단가: 거래단가
+    # 매매금액: 거래금액
+    # 위탁매매수수료: 수수료/Fee
+    # 각종세금: 수수료/Fee + 제세금/대출이자
+    # ========================================================
+
+    if transaction_name == "이체출금":
+        return (
+            quantity,
+            unit_price,
+            trade_amount,
+            fee,
+            fee + tax_fee,
+            "",
+        )
+
+    # ========================================================
+    # 이체입금 / 대체입금 / 대체출금 / 출금
     # ========================================================
 
     if transaction_name in CASH_TRANSFER_TYPES:
@@ -817,20 +869,10 @@ def calculate_row(
     # ========================================================
 
     if transaction_name == "배당입고":
-        exchange_rate = get_fx_rate(
-            row,
-            fx_tables,
-        )
-
-        converted_unit_price = (
-            unit_price
-            * exchange_rate
-        )
-
         return (
             quantity,
-            converted_unit_price,
-            quantity * converted_unit_price,
+            zero,
+            zero,
             zero,
             zero,
             "",
@@ -995,6 +1037,11 @@ def calculate_row(
     # ========================================================
     # 외화대체입금 / 외화대체출금
     # ========================================================
+    #
+    # 수량: 거래수량
+    # 매매단가: 거래단가
+    # 매매금액: 거래수량 × 거래단가
+    # ========================================================
 
     if transaction_name in {
         "외화대체입금",
@@ -1003,7 +1050,7 @@ def calculate_row(
         return (
             quantity,
             unit_price,
-            foreign_trade_amount,
+            quantity * unit_price,
             zero,
             zero,
             "",
@@ -1014,7 +1061,7 @@ def calculate_row(
     # ========================================================
 
     warning_message = (
-        f"규칙 미지정 거래명: {transaction_name}"
+        f"규칙 미지정 거래명: {transaction_original}"
     )
 
     return (
@@ -1335,9 +1382,15 @@ def save_output(
                 5
             ].number_format = "yyyy-mm-dd"
 
+            # 수량
+            row_cells[6].number_format = "#,##0.00"
+
+            # 매매단가: JPY 엔당 환율 9.xxxx도 확인할 수 있도록
+            # 소수점 넷째 자리까지 표시한다.
+            row_cells[7].number_format = "#,##0.0000"
+
+            # 매매금액 / 수수료 / 세금
             for column_index in (
-                6,
-                7,
                 8,
                 9,
                 10,

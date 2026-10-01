@@ -294,13 +294,19 @@ def find_input_files(
 # 환율 처리
 # ============================================================
 
-def adjust_fx_rate(
+def adjust_folder_fx_rate(
     currency_code: str,
     rate: Decimal,
 ) -> Decimal:
     """
-    JPY 환율은 100엔당 환율이므로
-    100으로 나누어 1엔당 환율로 바꾼다.
+    exchange_rate 폴더에서 읽은 환율을
+    실제 계산에 사용할 1통화 단위 환율로 변환한다.
+
+    중요:
+    - KB 원본 파일의 JPY 환율은 이미 1엔당 환율(예: 9.xxxx)이므로
+      이 함수에 넣지 않고 그대로 사용한다.
+    - exchange_rate 폴더의 JPY 환율만 100엔당 환율(예: 8xx~9xx)이므로
+      100으로 나누어 1엔당 환율로 변환한다.
     """
     currency_code = clean_text(
         currency_code
@@ -480,16 +486,15 @@ def get_effective_rate(
     환율 적용 순서:
 
     1순위:
-    원본 KB 파일의 환율 값이 있고 0이 아니면 해당 값 사용
+    원본 KB 파일의 환율 값이 있고 0이 아니면 해당 값을 그대로 사용한다.
+    - JPY도 KB 원본은 이미 1엔당 환율(예: 9.xxxx)이므로 그대로 사용한다.
 
     2순위:
-    원본 환율이 공란 또는 0이면 exchange_rate 폴더에서 조회
+    원본 환율이 공란 또는 0이면 exchange_rate 폴더에서 조회한다.
     - 통화구분과 동일한 환율 파일 사용
     - 거래일과 같은 날짜 우선
     - 같은 날짜가 없으면 가장 가까운 이전 날짜 사용
-
-    JPY:
-    원본 환율이든 폴더 환율이든 최종적으로 100으로 나눈다.
+    - 폴더의 JPY 환율은 100엔당 환율이므로 100으로 나눈다.
     """
     currency_code = clean_text(
         row.get("통화구분")
@@ -507,10 +512,9 @@ def get_effective_rate(
     )
 
     if original_rate != ZERO:
-        return adjust_fx_rate(
-            currency_code,
-            original_rate,
-        )
+        # KB 원본 환율은 통화와 관계없이 그대로 사용한다.
+        # 특히 JPY는 이미 1엔당 환율(약 8~10원)이다.
+        return original_rate
 
     # 2순위: exchange_rate 폴더 환율
     trade_date = parse_date_safe(
@@ -547,7 +551,7 @@ def get_effective_rate(
         trade_date
     )
 
-    return adjust_fx_rate(
+    return adjust_folder_fx_rate(
         currency_code,
         folder_rate,
     )
@@ -1405,9 +1409,10 @@ def save_output(
                 5
             ].number_format = "yyyy-mm-dd"
 
+            # 수량(G), 매매금액(I), 수수료(J), 세금(K)
+            # 은 소수 둘째 자리까지 표시한다.
             for column_index in (
                 6,
-                7,
                 8,
                 9,
                 10,
@@ -1415,6 +1420,11 @@ def save_output(
                 row_cells[
                     column_index
                 ].number_format = "#,##0.00"
+
+            # 매매단가(H)는 외화매수·외화매도에서 환율이 들어가므로
+            # JPY 1엔당 환율(예: 9.xxxx)을 확인할 수 있게
+            # 소수 넷째 자리까지 표시한다.
+            row_cells[7].number_format = "#,##0.0000"
 
     autosize_columns(
         worksheet
