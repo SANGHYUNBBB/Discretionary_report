@@ -6,13 +6,15 @@ import os
 import re
 import sys
 
+from report_paths import ROOT, ap_output_dir, final_dir, contract_output, contract_sheet
+
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 
 CONTRACT_LIST_NAME = "ContractList.xlsx"
-DEFAULT_OUTPUT_NAME = "SumAPList.xlsx"
+DEFAULT_OUTPUT_NAME = "SumAPLIst.xlsx"
 
 ALL_SHEET_NAME = "전체_내림차순"
 OVER_10_SHEET_NAME = "10%초과"
@@ -72,49 +74,14 @@ def is_cash_or_deposit(stock_name):
 
 
 def locate_dirs():
-    """
-    실행 위치를 자동 판단한다.
-
-    일반 사용:
-    - 이 스크립트가 Report/AP 폴더 안에 있음
-    - ContractList.xlsx는 Report 폴더 안에 있음
-    - 증권사별 정리 파일들은 Report/AP 폴더 안에 있음
-
-    샌드박스나 테스트:
-    - 파일들이 같은 폴더에 있어도 동작
-    """
-    base_dir = Path(__file__).resolve().parent
-
-    if base_dir.name.lower() == "ap":
-        ap_dir = base_dir
-        report_dir = base_dir.parent
-    elif (base_dir / "AP").exists():
-        report_dir = base_dir
-        ap_dir = base_dir / "AP"
-    else:
-        report_dir = base_dir
-        ap_dir = base_dir
-
-    return report_dir, ap_dir
+    return ROOT, ap_output_dir()
 
 
 def find_contract_list(report_dir, ap_dir):
-    candidates = [
-        report_dir / CONTRACT_LIST_NAME,
-        ap_dir / CONTRACT_LIST_NAME,
-    ]
-
-    candidates.extend(sorted(report_dir.glob("ContractList*.xlsx")))
-    candidates.extend(sorted(ap_dir.glob("ContractList*.xlsx")))
-
-    for path in candidates:
-        if path.exists() and not path.name.startswith("~$"):
-            return path
-
-    raise FileNotFoundError(
-        "ContractList.xlsx 파일을 찾지 못했습니다.\n"
-        f"확인한 폴더: {report_dir}, {ap_dir}"
-    )
+    path = contract_output()
+    if not path.exists():
+        raise FileNotFoundError("먼저 contract_report_list.py를 실행하세요.")
+    return path
 
 
 def read_active_contracts(contract_path):
@@ -132,7 +99,7 @@ def read_active_contracts(contract_path):
     wb = load_workbook(contract_path, data_only=True, read_only=True)
 
     try:
-        ws = wb[wb.sheetnames[0]]
+        ws = contract_sheet(wb)
 
         active_by_exact_key = {}
         active_by_account = defaultdict(list)
@@ -308,7 +275,7 @@ def pick_best_file(ap_dir, broker):
     candidates = []
 
     for pattern in patterns[broker]:
-        candidates.extend(ap_dir.glob(pattern))
+        candidates.extend((ap_dir / broker).glob(pattern))
 
     filtered = []
     for path in candidates:
@@ -814,10 +781,10 @@ def main():
         output_path = (
             requested_output
             if requested_output.is_absolute()
-            else report_dir / requested_output
+            else final_dir() / requested_output
         )
     else:
-        output_path = report_dir / DEFAULT_OUTPUT_NAME
+        output_path = final_dir() / DEFAULT_OUTPUT_NAME
 
     contract_path = find_contract_list(report_dir, ap_dir)
 

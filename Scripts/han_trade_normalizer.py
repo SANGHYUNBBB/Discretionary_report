@@ -1,11 +1,5 @@
 from __future__ import annotations
 
-# 삼성증권 거래내역 정리
-# - 원본 파일에는 환율 열이 없으므로 환율이 필요한 거래는 모두
-#   exchange_rate 폴더에서 통화코드와 거래일자로 조회한다.
-# - 동일 날짜가 없으면 가장 가까운 이전 날짜를 사용한다.
-# - JPY 환율 파일은 100엔당 환율이므로 조회 후 100으로 나눈다.
-
 import bisect
 import os
 import re
@@ -14,6 +8,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from zipfile import ZipFile
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
@@ -22,23 +17,15 @@ from openpyxl.utils import get_column_letter
 
 
 # ============================================================
-# 환경설정
+# 기본 설정
 # ============================================================
 
-BASE_DIR = Path.cwd()
+from report_paths import trade_input_dir, trade_output_path, exchange_dir, trade_files
+from tax_refunds import is_tax_refund, negative_refund, first_nonzero
 
-INPUT_PATTERNS = [
-    "Samsung26q2*.xlsx",
-    "Samsung26q2*.xlsm",
-    "삼성거래내역*.xlsx",
-    "삼성거래내역*.xlsm",
-]
+BASE_DIR = trade_input_dir("한투")
 
-EXCHANGE_DIR_NAMES = [
-    "exchange_rate",
-    "Exchange_Rate",
-    "EXCHANGE_RATE",
-]
+
 
 OUTPUT_SUFFIX = "_정리.xlsx"
 
@@ -66,32 +53,11 @@ CURRENCY_CODES = {
     "AUD",
     "CAD",
     "CHF",
-    "SGD",
-    "TWD",
-}
-
-DOMESTIC_STOCK_TYPES = {
-    "매수",
-    "매도",
-    "매수_NXT",
-    "매도_NXT",
-}
-
-CASH_TRANSFER_TYPES = {
-    "이체입금",
-    "대체입금",
-    "대체출금",
-    "출금",
-}
-
-SUPPORT_BONUS_TYPES = {
-    "투자지원금",
-    "투자지원금입금",
 }
 
 
 # ============================================================
-# 환율 데이터 구조
+# 환율 테이블
 # ============================================================
 
 @dataclass
@@ -101,8 +67,8 @@ class ExchangeTable:
 
     def lookup(self, target_date: date) -> Decimal:
         """
-        거래일과 같은 날짜의 환율을 우선 사용한다.
-        같은 날짜가 없으면 가장 가까운 이전 날짜의 환율을 사용한다.
+        거래일과 같거나 거래일보다 이전인 날짜 중
+        가장 최근 환율을 반환한다.
         """
         target_ordinal = target_date.toordinal()
 
@@ -130,30 +96,24 @@ def clean_text(value) -> str:
     return str(value).strip()
 
 
-def normalize_transaction(value) -> str:
-    """
-    거래명의 모든 공백을 제거해 비교한다.
-
-    예:
-    투자지원금 입금 -> 투자지원금입금
-    """
-    return re.sub(
-        r"\s+",
-        "",
-        clean_text(value),
-    )
-
-
 def safe_excel_text(value) -> str:
+    """
+    엑셀 XML에서 사용할 수 없는 제어문자를 제거한다.
+    """
+    text = clean_text(value)
+
     return ILLEGAL_CHARACTERS_RE.sub(
         "",
-        clean_text(value),
+        text,
     )
 
 
 def set_plain_text(cell, value) -> None:
     """
-    문자열을 수식이 아닌 일반 텍스트로 저장한다.
+    셀 값을 수식이 아닌 일반 문자열로 강제 저장한다.
+
+    값이 =, +, -, @ 등으로 시작하더라도
+    수식으로 저장되지 않는다.
     """
     cell.value = safe_excel_text(value)
     cell.data_type = "s"
@@ -161,7 +121,10 @@ def set_plain_text(cell, value) -> None:
 
 def to_decimal(value) -> Decimal:
     """
-    공란, 비정상 숫자, NaN, 무한대는 0으로 처리한다.
+    엑셀 값을 Decimal 숫자로 변환한다.
+
+    공란, None, 숫자가 아닌 값은 0으로 처리한다.
+    NaN과 무한대도 0으로 처리한다.
     """
     if value is None or value == "":
         return Decimal("0")
@@ -174,9 +137,8 @@ def to_decimal(value) -> Decimal:
 
     else:
         try:
-            result = Decimal(
-                str(value).replace(",", "").strip()
-            )
+            text = str(value).replace(",", "").strip()
+            result = Decimal(text)
 
         except (
             InvalidOperation,
@@ -192,6 +154,9 @@ def to_decimal(value) -> Decimal:
 
 
 def parse_date_safe(value) -> Optional[date]:
+    """
+    엑셀 날짜 또는 문자열 날짜를 date 형식으로 변환한다.
+    """
     if value is None or value == "":
         return None
 
@@ -203,12 +168,14 @@ def parse_date_safe(value) -> Optional[date]:
 
     text = clean_text(value)
 
-    for date_format in (
+    date_formats = [
+        "%Y/%m/%d",
         "%Y-%m-%d",
         "%Y.%m.%d",
-        "%Y/%m/%d",
         "%Y%m%d",
-    ):
+    ]
+
+    for date_format in date_formats:
         try:
             return datetime.strptime(
                 text,
@@ -221,94 +188,17 @@ def parse_date_safe(value) -> Optional[date]:
     return None
 
 
-def extract_account_info(
-    a1_value,
-) -> Tuple[str, str]:
-    """
-    A1 값에서 계좌번호와 계약자명을 분리한다.
-    """
-    text = clean_text(a1_value)
-
-    account_match = re.search(
-        r"(\d+(?:-\d+)+)",
-        text,
-    )
-
-    if account_match:
-        account_number = account_match.group(1)
-
-    else:
-        number_match = re.search(
-            r"(\d{8,})",
-            text,
-        )
-
-        account_number = (
-            number_match.group(1)
-            if number_match
-            else ""
-        )
-
-    holder_match = re.search(
-        r"\]\s*(.+)$",
-        text,
-    )
-
-    if holder_match:
-        holder = holder_match.group(1).strip()
-
-    elif account_match:
-        holder = text[
-            account_match.end():
-        ].strip()
-
-    else:
-        holder = ""
-
-    return account_number, holder
-
-
 # ============================================================
 # 파일 및 폴더 검색
 # ============================================================
 
-def find_exchange_dir(
-    base_dir: Path,
-) -> Optional[Path]:
-    for directory_name in EXCHANGE_DIR_NAMES:
-        directory_path = base_dir / directory_name
-
-        if (
-            directory_path.exists()
-            and directory_path.is_dir()
-        ):
-            return directory_path
-
-    return None
+def find_exchange_dir(base_dir: Path) -> Optional[Path]:
+    path = exchange_dir()
+    return path if path.is_dir() else None
 
 
-def find_input_files(
-    base_dir: Path,
-) -> List[Path]:
-    """
-    정리 결과, 임시파일, Excel 잠금 파일은 제외한다.
-    """
-    files: List[Path] = []
-
-    for pattern in INPUT_PATTERNS:
-        files.extend(
-            base_dir.glob(pattern)
-        )
-
-    result = {
-        file_path.resolve()
-        for file_path in files
-        if not file_path.name.startswith("~$")
-        and not file_path.stem.endswith("_정리")
-        and "_작성중" not in file_path.stem
-    }
-
-    return sorted(result)
+def find_input_files(base_dir: Path) -> List[Path]:
+    return trade_files("한투")
 
 
 # ============================================================
@@ -320,8 +210,10 @@ def adjust_fx_rate(
     rate: Decimal,
 ) -> Decimal:
     """
-    JPY 환율은 100엔당 환율이므로
-    100으로 나누어 엔당 환율로 변환한다.
+    JPY 환율은 100엔 기준이므로 100으로 나눈다.
+
+    예:
+    환율 910 → 실제 적용 환율 9.10
     """
     currency_code = clean_text(
         currency_code
@@ -333,45 +225,23 @@ def adjust_fx_rate(
     return rate
 
 
-def extract_currency_code_from_filename(
-    file_path: Path,
-) -> str:
-    """
-    다음과 같은 파일명에서 통화코드를 찾는다.
-
-    USD.xlsx
-    USD_환율.xlsx
-    환율_USD.xlsx
-    """
-    stem_upper = (
-        file_path.stem.strip().upper()
-    )
-
-    currency_match = re.search(
-        r"(?<![A-Z])([A-Z]{3})(?![A-Z])",
-        stem_upper,
-    )
-
-    if currency_match:
-        return currency_match.group(1)
-
-    return stem_upper
-
-
 def load_exchange_rates(
     exchange_dir: Optional[Path],
 ) -> Dict[str, ExchangeTable]:
     """
     exchange_rate 폴더의 환율 파일을 읽는다.
 
-    - 파일명: 통화코드 포함
-    - 첫 번째 시트
+    환율 파일 형식:
+    - 파일명: USD.xlsx, JPY.xlsx 등
+    - 첫 번째 시트 사용
     - A열: 날짜
     - C열: 환율
     - 10행부터 데이터
     """
     rate_map: Dict[str, ExchangeTable] = {}
 
+    # 원본 환율열이 있으면 처리할 수 있으므로
+    # exchange_rate 폴더가 없어도 바로 종료하지 않는다.
     if exchange_dir is None:
         return rate_map
 
@@ -399,10 +269,7 @@ def load_exchange_rates(
             file_path.resolve()
         )
 
-        if (
-            resolved_path in seen_paths
-            or file_path.name.startswith("~$")
-        ):
+        if resolved_path in seen_paths:
             continue
 
         seen_paths.add(resolved_path)
@@ -410,9 +277,7 @@ def load_exchange_rates(
 
     for file_path in unique_files:
         currency_code = (
-            extract_currency_code_from_filename(
-                file_path
-            )
+            file_path.stem.strip().upper()
         )
 
         if currency_code not in CURRENCY_CODES:
@@ -429,9 +294,8 @@ def load_exchange_rates(
                 workbook.sheetnames[0]
             ]
 
-            date_rate_pairs: List[
-                Tuple[int, Decimal]
-            ] = []
+            dates_ord: List[int] = []
+            rates: List[Decimal] = []
 
             for row_number in range(
                 10,
@@ -449,30 +313,35 @@ def load_exchange_rates(
                     ].value
                 )
 
-                if (
-                    exchange_date is None
-                    or exchange_rate == Decimal("0")
-                ):
+                if exchange_date is None:
                     continue
 
-                date_rate_pairs.append(
-                    (
-                        exchange_date.toordinal(),
-                        exchange_rate,
-                    )
+                if exchange_rate == Decimal("0"):
+                    continue
+
+                dates_ord.append(
+                    exchange_date.toordinal()
+                )
+
+                rates.append(
+                    exchange_rate
                 )
 
         finally:
             workbook.close()
 
-        if not date_rate_pairs:
+        if not dates_ord:
             raise ValueError(
                 "환율 파일에서 날짜와 환율을 "
                 f"찾지 못했습니다: {file_path}"
             )
 
-        date_rate_pairs.sort(
-            key=lambda item: item[0]
+        paired_data = sorted(
+            zip(
+                dates_ord,
+                rates,
+            ),
+            key=lambda item: item[0],
         )
 
         rate_map[
@@ -480,29 +349,71 @@ def load_exchange_rates(
         ] = ExchangeTable(
             dates_ord=[
                 item[0]
-                for item in date_rate_pairs
+                for item in paired_data
             ],
             rates=[
                 item[1]
-                for item in date_rate_pairs
+                for item in paired_data
             ],
         )
 
     return rate_map
 
 
-def get_fx_rate(
+def split_tx_and_currency(
+    transaction_text: str,
+) -> Tuple[str, str]:
+    """
+    거래종류의 마지막 3글자로 통화코드를 판별한다.
+
+    예:
+    해외증권매수USD
+    → 해외증권매수, USD
+
+    해외증권매도JPY
+    → 해외증권매도, JPY
+    """
+    transaction_text = clean_text(
+        transaction_text
+    )
+
+    if len(transaction_text) < 3:
+        return transaction_text, ""
+
+    suffix = (
+        transaction_text[-3:].upper()
+    )
+
+    if suffix in CURRENCY_CODES:
+        base_transaction = (
+            transaction_text[:-3].strip()
+        )
+
+        return (
+            base_transaction,
+            suffix,
+        )
+
+    return transaction_text, ""
+
+
+def get_effective_rate(
     row: dict,
     fx_tables: Dict[str, ExchangeTable],
 ) -> Decimal:
     """
-    삼성증권 원본에는 환율 열이 없으므로
-    환율은 모두 exchange_rate에서 조회한다.
+    환율 적용 우선순위:
 
-    1. 통화코드에 해당하는 환율 파일 선택
-    2. 거래일과 같은 날짜 사용
-    3. 같은 날짜가 없으면 가장 가까운 이전 날짜 사용
-    4. JPY는 100으로 나누어 엔당 환율로 변환
+    1순위
+    원본 환율열 값이 있고 0이 아니면 원본 환율 적용
+
+    2순위
+    원본 환율이 공란 또는 0이면 exchange_rate 폴더 적용
+
+    추가 규칙
+    - 거래종류 마지막 3글자로 통화코드 확인
+    - JPY는 환율을 100으로 나누어 적용
+    - 통화코드가 없으면 원화 거래로 보고 환율 1 적용
     """
     currency_code = clean_text(
         row.get("통화코드")
@@ -514,14 +425,32 @@ def get_fx_rate(
     ):
         return Decimal("1")
 
+    # --------------------------------------------------------
+    # 1순위: 원본 환율열
+    # --------------------------------------------------------
+
+    original_rate = to_decimal(
+        row.get("환율")
+    )
+
+    if original_rate != Decimal("0"):
+        return adjust_fx_rate(
+            currency_code,
+            original_rate,
+        )
+
+    # --------------------------------------------------------
+    # 2순위: exchange_rate 폴더
+    # --------------------------------------------------------
+
     trade_date = parse_date_safe(
-        row.get("거래일자")
+        row.get("거래일")
     )
 
     if trade_date is None:
         raise ValueError(
-            "환율 조회에 필요한 거래일자를 "
-            "해석할 수 없습니다."
+            "원본 환율이 공란 또는 0이고 "
+            "거래일도 해석할 수 없습니다."
         )
 
     exchange_table = fx_tables.get(
@@ -538,48 +467,45 @@ def get_fx_rate(
         )
 
         raise KeyError(
-            f"통화코드 {currency_code}에 해당하는 "
-            "환율 파일을 찾지 못했습니다. "
-            f"사용 가능한 통화코드: {available_codes}"
+            f"원본 환율이 공란 또는 0이며 "
+            f"{currency_code} 환율 파일도 없습니다. "
+            f"사용 가능한 환율: {available_codes}"
         )
 
-    raw_rate = exchange_table.lookup(
+    folder_rate = exchange_table.lookup(
         trade_date
     )
 
     return adjust_fx_rate(
         currency_code,
-        raw_rate,
+        folder_rate,
     )
 
 
 # ============================================================
-# 거래명 판별
+# 세금 계산
 # ============================================================
 
-def is_foreign_stock_transaction(
-    transaction_name: str,
-    currency_code: str,
-) -> bool:
+def tax_sum_raw(row: dict) -> Decimal:
     """
-    미국(NASDAQ)주식매수, 미국(NYSE)주식매도,
-    일본(동경)주식매수, 홍콩주식매도 등을 판별한다.
+    각종세금 = 거래세 + 세금 + 부가세
     """
-    currency_code = clean_text(
-        currency_code
-    ).upper()
+    transaction_tax = to_decimal(
+        row.get("거래세")
+    )
 
-    if currency_code in (
-        "",
-        "KRW",
-    ):
-        return False
+    tax = to_decimal(
+        row.get("세금")
+    )
 
-    return transaction_name.endswith(
-        (
-            "주식매수",
-            "주식매도",
-        )
+    additional_tax = to_decimal(
+        row.get("부가세")
+    )
+
+    return (
+        transaction_tax
+        + tax
+        + additional_tax
     )
 
 
@@ -608,17 +534,13 @@ def calculate_row(
     각종세금,
     검토메시지
     """
-    transaction_original = clean_text(
-        row.get("거래명")
+    transaction_type = clean_text(
+        row.get("구분기준거래종류")
     )
 
-    transaction_name = normalize_transaction(
-        transaction_original
+    transaction_key = (
+        transaction_type.casefold()
     )
-
-    currency_code = clean_text(
-        row.get("통화코드")
-    ).upper()
 
     quantity = to_decimal(
         row.get("거래수량")
@@ -632,141 +554,281 @@ def calculate_row(
         row.get("거래금액")
     )
 
-    foreign_trade_amount = to_decimal(
-        row.get("외화거래금액")
-    )
-
     fee = to_decimal(
-        row.get("수수료/Fee")
+        row.get("수수료")
     )
 
-    tax_fee = to_decimal(
-        row.get("제세금/대출이자")
-    )
-
-    foreign_fee = to_decimal(
-        row.get("외화수수료")
-    )
+    raw_tax = tax_sum_raw(row)
 
     zero = Decimal("0")
 
+    if is_tax_refund(transaction_type):
+        rate = get_effective_rate(row, fx_tables)
+        amount = first_nonzero(trade_amount, raw_tax) * rate
+        return zero, zero, zero, zero, negative_refund(amount), ""
+
     # ========================================================
-    # 외화매수 / 외화매도
-    # ========================================================
-    #
-    # 수량: 거래수량
-    # 매매단가: 거래단가
-    # 매매금액: 수량 × 매매단가
-    #
-    # JPY:
-    # 매매금액 = 수량 × 매매단가 ÷ 100
+    # 해외증권매도 / 해외증권매수
     # ========================================================
 
-    if transaction_name in {
-        "외화매수",
-        "외화매도",
+    if transaction_type in {
+        "해외증권매도",
+        "해외증권매수",
     }:
-        output_amount = (
-            quantity
-            * unit_price
-        )
-
-        if currency_code == "JPY":
-            output_amount = (
-                output_amount
-                / Decimal("100")
-            )
-
-        return (
-            quantity,
-            unit_price,
-            output_amount,
-            zero,
-            zero,
-            "",
-        )
-
-    # ========================================================
-    # 외국주식 매수 / 매도
-    # ========================================================
-
-    if is_foreign_stock_transaction(
-        transaction_name,
-        currency_code,
-    ):
-        # 삼성증권 원본에는 환율 열이 없으므로 거래일과 통화코드로
-        # exchange_rate 폴더에서 환율을 조회한다.
-        # JPY는 get_fx_rate()에서 100엔당 환율을 1엔당 환율로 변환한다.
-        exchange_rate = get_fx_rate(
+        exchange_rate = get_effective_rate(
             row,
             fx_tables,
         )
 
-        # 외국주식 매수·매도 적용 규칙
-        # 수량               = 거래수량
-        # 매매단가           = 거래단가 × 환율
-        # 매매금액           = 외화거래금액 × 환율
-        # 위탁매매수수료     = 외화수수료 × 환율
-        # 각종세금           = 제세금/대출이자 × 환율
-        output_unit_price = unit_price * exchange_rate
-        output_trade_amount = foreign_trade_amount * exchange_rate
-        output_fee = foreign_fee * exchange_rate
-        output_tax = tax_fee * exchange_rate
+        output_unit_price = (
+            unit_price
+            * exchange_rate
+        )
 
         return (
             quantity,
             output_unit_price,
-            output_trade_amount,
-            output_fee,
-            output_tax,
+            quantity * output_unit_price,
+            fee * exchange_rate,
+            raw_tax * exchange_rate,
             "",
         )
 
     # ========================================================
-    # 국내주식 매수 / 매도
+    # 해외증권배당금입금
     # ========================================================
 
-    if transaction_name in DOMESTIC_STOCK_TYPES:
+    if transaction_type == "해외증권배당금입금":
+        exchange_rate = get_effective_rate(
+            row,
+            fx_tables,
+        )
+
+        return (
+            zero,
+            zero,
+            trade_amount * exchange_rate,
+            fee * exchange_rate,
+            raw_tax * exchange_rate,
+            "",
+        )
+
+    # ========================================================
+    # 해외주식배당원화세금
+    # ========================================================
+
+    if transaction_type == "해외주식배당원화세금":
+        return (
+            zero,
+            zero,
+            zero,
+            fee,
+            raw_tax,
+            "",
+        )
+
+    # ========================================================
+    # 외화매수 / 외화매도 / 자동환전(외화매도)
+    # ========================================================
+
+    if transaction_type in {
+        "외화매수",
+        "외화매도",
+        "자동환전(외화매도)",
+    }:
+        exchange_rate = get_effective_rate(
+            row,
+            fx_tables,
+        )
+
+        return (
+            trade_amount,
+            exchange_rate,
+            trade_amount * exchange_rate,
+            fee * exchange_rate,
+            raw_tax * exchange_rate,
+            "",
+        )
+
+    # ========================================================
+    # 외화예탁금이용료입금
+    # ========================================================
+
+    if transaction_type == "외화예탁금이용료입금":
+        exchange_rate = get_effective_rate(
+            row,
+            fx_tables,
+        )
+
+        return (
+            trade_amount,
+            exchange_rate,
+            trade_amount * exchange_rate,
+            fee * exchange_rate,
+            raw_tax * exchange_rate,
+            "",
+        )
+
+    # ========================================================
+    # 외화예탁금이용료원화세금
+    # ========================================================
+
+    if transaction_type == "외화예탁금이용료원화세금":
+        return (
+            zero,
+            zero,
+            zero,
+            fee,
+            raw_tax,
+            "",
+        )
+
+    # ========================================================
+    # 예탁금이용료
+    # ========================================================
+
+    if transaction_type == "예탁금이용료":
+        return (
+            zero,
+            zero,
+            trade_amount,
+            fee,
+            raw_tax,
+            "",
+        )
+
+    # ========================================================
+    # 외화실시간직접매도환전
+    # HTS자문사외화실시간직접매도환전
+    # ========================================================
+
+    if transaction_type in {
+        "외화실시간직접매도환전",
+        "HTS자문사외화실시간직접매도환전",
+    }:
+        exchange_rate = get_effective_rate(
+            row,
+            fx_tables,
+        )
+
+        return (
+            trade_amount,
+            exchange_rate,
+            trade_amount * exchange_rate,
+            fee * exchange_rate,
+            raw_tax * exchange_rate,
+            "",
+        )
+
+    # ========================================================
+    # 외화당사이체입금
+    # ========================================================
+
+    if transaction_type == "외화당사이체입금":
+        exchange_rate = get_effective_rate(
+            row,
+            fx_tables,
+        )
+
+        return (
+            trade_amount,
+            exchange_rate,
+            trade_amount * exchange_rate,
+            fee * exchange_rate,
+            raw_tax * exchange_rate,
+            "",
+        )
+
+    # ========================================================
+    # 랩대체계약출금
+    # 당사이체출금
+    # smart+당사이체출금
+    # smart+당사이체입금
+    # ========================================================
+
+    if transaction_key in {
+        "랩대체계약출금".casefold(),
+        "당사이체출금".casefold(),
+        "smart+당사이체출금".casefold(),
+        "smart+당사이체입금".casefold(),
+    }:
+        return (
+            zero,
+            zero,
+            trade_amount,
+            fee,
+            raw_tax,
+            "",
+        )
+
+    # ========================================================
+    # 현지세금재징수
+    # ========================================================
+
+    if transaction_type == "현지세금재징수":
+        exchange_rate = get_effective_rate(
+            row,
+            fx_tables,
+        )
+
+        return (
+            zero,
+            zero,
+            zero,
+            zero,
+            trade_amount * exchange_rate,
+            "",
+        )
+
+    # ========================================================
+    # wrap해지입고
+    # ========================================================
+
+    if transaction_key == "wrap해지입고".casefold():
         return (
             quantity,
             unit_price,
-            quantity * unit_price,
-            fee,
-            tax_fee,
+            zero,
+            zero,
+            zero,
             "",
         )
 
     # ========================================================
-    # 세금출금(해외)
+    # wrap해지입금
     # ========================================================
     #
     # 수량: 거래수량
     # 매매단가: 거래단가
-    # 매매금액: 0
-    # 각종세금: 수량 × 거래단가
-    #
-    # JPY:
-    # 각종세금 = 수량 × 거래단가 ÷ 100
+    # 매매금액: 거래금액
+    # 위탁매매수수료: 수수료
+    # 각종세금: 거래세 + 세금 + 부가세
     # ========================================================
 
-    if transaction_name == "세금출금(해외)":
-        output_tax = (
-            quantity
-            * unit_price
-        )
-
-        if currency_code == "JPY":
-            output_tax = (
-                output_tax
-                / Decimal("100")
-            )
-
+    if transaction_key == "wrap해지입금".casefold():
         return (
             quantity,
             unit_price,
-            zero,
-            zero,
-            output_tax,
+            trade_amount,
+            fee,
+            raw_tax,
+            "",
+        )
+
+    # ========================================================
+    # 거래소주식매도 / 코스닥주식매도
+    # ========================================================
+
+    if transaction_type in {
+        "거래소주식매도",
+        "코스닥주식매도",
+    }:
+        return (
+            quantity,
+            unit_price,
+            trade_amount,
+            fee,
+            raw_tax,
             "",
         )
 
@@ -774,294 +836,36 @@ def calculate_row(
     # 배당금입금
     # ========================================================
 
-    if transaction_name == "배당금입금":
-        if currency_code in (
-            "",
-            "KRW",
-        ):
-            return (
-                zero,
-                zero,
-                trade_amount,
-                zero,
-                tax_fee,
-                "",
-            )
-
-        exchange_rate = get_fx_rate(
-            row,
-            fx_tables,
-        )
-
-        return (
-            quantity,
-            exchange_rate,
-            quantity * exchange_rate,
-            zero,
-            tax_fee,
-            "",
-        )
-
-    # ========================================================
-    # 이체출금
-    # ========================================================
-    # 수량: 거래수량
-    # 매매단가: 거래단가
-    # 매매금액: 거래금액
-    # 위탁매매수수료: 수수료/Fee
-    # 각종세금: 수수료/Fee + 제세금/대출이자
-    # ========================================================
-
-    if transaction_name == "이체출금":
-        return (
-            quantity,
-            unit_price,
-            trade_amount,
-            fee,
-            fee + tax_fee,
-            "",
-        )
-
-    # ========================================================
-    # 이체입금 / 대체입금 / 대체출금 / 출금
-    # ========================================================
-
-    if transaction_name in CASH_TRANSFER_TYPES:
-        return (
-            zero,
-            zero,
-            trade_amount,
-            zero,
-            zero,
-            "",
-        )
-
-    # ========================================================
-    # 투자지원금
-    # ========================================================
-
-    if transaction_name in SUPPORT_BONUS_TYPES:
-        return (
-            quantity,
-            unit_price,
-            quantity * unit_price,
-            zero,
-            zero,
-            "",
-        )
-
-    # ========================================================
-    # 이용료입금
-    # ========================================================
-
-    if transaction_name == "이용료입금":
-        return (
-            zero,
-            zero,
-            trade_amount,
-            zero,
-            fee + tax_fee,
-            "",
-        )
-
-    # ========================================================
-    # 배당입고
-    # ========================================================
-
-    if transaction_name == "배당입고":
-        return (
-            quantity,
-            zero,
-            zero,
-            zero,
-            zero,
-            "",
-        )
-
-    # ========================================================
-    # 수수료입금
-    # ========================================================
-
-    if transaction_name == "수수료입금":
-        return (
-            zero,
-            zero,
-            zero,
-            trade_amount,
-            zero,
-            "",
-        )
-
-    # ========================================================
-    # 자문사수수료출금
-    # ========================================================
-
-    if transaction_name == "자문사수수료출금":
-        return (
-            zero,
-            zero,
-            trade_amount,
-            zero,
-            zero,
-            "",
-        )
-
-    # ========================================================
-    # 외화이체입금 / 외화이체출금
-    # ========================================================
-
-    if transaction_name in {
-        "외화이체입금",
-        "외화이체출금",
-    }:
-        exchange_rate = get_fx_rate(
-            row,
-            fx_tables,
-        )
-
-        return (
-            quantity,
-            exchange_rate,
-            quantity * exchange_rate,
-            zero,
-            zero,
-            "",
-        )
-
-    # ========================================================
-    # 대차출고
-    # ========================================================
-
-    if transaction_name == "대차출고":
-        return (
-            quantity,
-            zero,
-            trade_amount,
-            zero,
-            fee + tax_fee,
-            "",
-        )
-
-    # ========================================================
-    # 외화배당세금환급
-    # ========================================================
-
-    if transaction_name == "외화배당세금환급":
-        exchange_rate = get_fx_rate(
-            row,
-            fx_tables,
-        )
-
-        return (
-            quantity,
-            exchange_rate,
-            quantity * exchange_rate,
-            zero,
-            fee,
-            "",
-        )
-
-    # ========================================================
-    # 세금출금(국내)
-    # ========================================================
-
-    if transaction_name == "세금출금(국내)":
-        return (
-            zero,
-            zero,
-            zero,
-            zero,
-            tax_fee,
-            "",
-        )
-
-    # ========================================================
-    # 이자입금
-    # ========================================================
-
-    if transaction_name == "이자입금":
+    if transaction_type == "배당금입금":
         return (
             zero,
             zero,
             trade_amount,
             fee,
-            tax_fee,
+            raw_tax,
             "",
         )
 
     # ========================================================
-    # 타사출고
+    # 당사이체입금
     # ========================================================
 
-    if transaction_name == "타사출고":
-        return (
-            quantity,
-            unit_price,
-            trade_amount,
-            fee,
-            tax_fee,
-            "",
-        )
-
-    # ========================================================
-    # 청약 / 청약입고
-    # ========================================================
-
-    if transaction_name in {
-        "청약",
-        "청약입고",
-    }:
-        return (
-            quantity,
-            unit_price,
-            quantity * unit_price,
-            fee,
-            tax_fee,
-            "",
-        )
-
-    # ========================================================
-    # 오픈이체출금
-    # ========================================================
-
-    if transaction_name == "오픈이체출금":
+    if transaction_type == "당사이체입금":
         return (
             zero,
             zero,
             trade_amount,
             fee,
-            tax_fee,
+            raw_tax,
             "",
         )
 
     # ========================================================
-    # 외화대체입금 / 외화대체출금
-    # ========================================================
-    #
-    # 수량: 거래수량
-    # 매매단가: 거래단가
-    # 매매금액: 거래수량 × 거래단가
-    # ========================================================
-
-    if transaction_name in {
-        "외화대체입금",
-        "외화대체출금",
-    }:
-        return (
-            quantity,
-            unit_price,
-            quantity * unit_price,
-            zero,
-            zero,
-            "",
-        )
-
-    # ========================================================
-    # 규칙 미지정
+    # 규칙 미지정 거래
     # ========================================================
 
     warning_message = (
-        f"규칙 미지정 거래명: {transaction_original}"
+        f"규칙 미지정 거래종류: {transaction_type}"
     )
 
     return (
@@ -1069,39 +873,75 @@ def calculate_row(
         unit_price,
         trade_amount,
         fee,
-        tax_fee,
+        raw_tax,
         warning_message,
     )
 
 
 # ============================================================
-# 시트 헤더 처리
+# 원본 엑셀 헤더 찾기
 # ============================================================
 
 def build_header_map(
     worksheet,
-    header_row_index: int,
 ) -> Dict[str, int]:
-    header_map: Dict[str, int] = {}
-
-    for column_number in range(
-        1,
-        worksheet.max_column + 1,
-    ):
-        header_name = clean_text(
+    headers = [
+        clean_text(
             worksheet.cell(
-                header_row_index,
+                1,
                 column_number,
             ).value
         )
+        for column_number in range(
+            1,
+            worksheet.max_column + 1,
+        )
+    ]
 
-        if (
-            header_name
-            and header_name not in header_map
-        ):
+    header_map: Dict[str, int] = {}
+
+    for (
+        column_number,
+        header_name,
+    ) in enumerate(
+        headers,
+        start=1,
+    ):
+        if not header_name:
+            continue
+
+        if header_name not in header_map:
             header_map[
                 header_name
             ] = column_number
+
+        # 거래종류 실제 텍스트가
+        # '거래종류' 헤더 다음 빈 헤더 열에 있는 형식
+        if (
+            header_name == "거래종류"
+            and column_number
+            < worksheet.max_column
+            and clean_text(
+                worksheet.cell(
+                    1,
+                    column_number + 1,
+                ).value
+            ) == ""
+        ):
+            header_map[
+                "거래종류_텍스트"
+            ] = column_number + 1
+
+    if "거래종류_텍스트" not in header_map:
+        if "거래종류" not in header_map:
+            raise KeyError(
+                f"시트 '{worksheet.title}'에서 "
+                "'거래종류' 헤더를 찾지 못했습니다."
+            )
+
+        header_map[
+            "거래종류_텍스트"
+        ] = header_map["거래종류"]
 
     return header_map
 
@@ -1114,31 +954,24 @@ def read_sheet_rows(
     worksheet,
     fx_tables: Dict[str, ExchangeTable],
 ) -> Tuple[List[List], List[str]]:
-    account_number, holder = (
-        extract_account_info(
-            worksheet["A1"].value
-        )
-    )
-
-    header_row_index = 3
-
     header_map = build_header_map(
-        worksheet,
-        header_row_index,
+        worksheet
     )
 
     required_headers = [
-        "거래일자",
-        "거래명",
+        "계좌번호",
+        "계좌명",
+        "거래일",
+        "거래종류_텍스트",
         "종목명",
         "거래수량",
         "거래단가",
         "거래금액",
-        "외화거래금액",
-        "제세금/대출이자",
-        "수수료/Fee",
-        "통화코드",
-        "외화수수료",
+        "수수료",
+        "거래세",
+        "세금",
+        "부가세",
+        "환율",
     ]
 
     for header_name in required_headers:
@@ -1152,31 +985,59 @@ def read_sheet_rows(
     output_rows: List[List] = []
     warnings: List[str] = []
 
+    current_account_number = ""
+    current_account_holder = ""
+
     for row_number in range(
-        4,
+        2,
         worksheet.max_row + 1,
     ):
-        transaction_name = worksheet.cell(
-            row_number,
-            header_map["거래명"],
-        ).value
+        transaction_raw = clean_text(
+            worksheet.cell(
+                row_number,
+                header_map[
+                    "거래종류_텍스트"
+                ],
+            ).value
+        )
 
-        trade_date = worksheet.cell(
+        trade_date_value = worksheet.cell(
             row_number,
-            header_map["거래일자"],
+            header_map["거래일"],
         ).value
 
         if (
-            transaction_name in (
-                None,
-                "",
-            )
-            and trade_date in (
+            transaction_raw == ""
+            and trade_date_value in (
                 None,
                 "",
             )
         ):
             continue
+
+        account_number_value = clean_text(
+            worksheet.cell(
+                row_number,
+                header_map["계좌번호"],
+            ).value
+        )
+
+        account_holder_value = clean_text(
+            worksheet.cell(
+                row_number,
+                header_map["계좌명"],
+            ).value
+        )
+
+        if account_number_value:
+            current_account_number = (
+                account_number_value
+            )
+
+        if account_holder_value:
+            current_account_holder = (
+                account_holder_value
+            )
 
         row_data = {
             header_name: worksheet.cell(
@@ -1188,6 +1049,21 @@ def read_sheet_rows(
                 column_number,
             ) in header_map.items()
         }
+
+        (
+            base_transaction,
+            currency_code,
+        ) = split_tx_and_currency(
+            transaction_raw
+        )
+
+        row_data[
+            "통화코드"
+        ] = currency_code
+
+        row_data[
+            "구분기준거래종류"
+        ] = base_transaction
 
         try:
             (
@@ -1204,30 +1080,15 @@ def read_sheet_rows(
 
         except Exception as error:
             warning_message = (
-                f"계산 실패("
-                f"{clean_text(row_data.get('거래명'))}"
-                f"): {error}"
+                f"계산 실패({base_transaction}): "
+                f"{error}"
             )
 
-            output_quantity = to_decimal(
-                row_data.get("거래수량")
-            )
-
-            output_unit_price = to_decimal(
-                row_data.get("거래단가")
-            )
-
-            output_trade_amount = to_decimal(
-                row_data.get("거래금액")
-            )
-
-            output_fee = to_decimal(
-                row_data.get("수수료/Fee")
-            )
-
-            output_tax = to_decimal(
-                row_data.get("제세금/대출이자")
-            )
+            output_quantity = Decimal("0")
+            output_unit_price = Decimal("0")
+            output_trade_amount = Decimal("0")
+            output_fee = Decimal("0")
+            output_tax = Decimal("0")
 
         if warning_message:
             warnings.append(
@@ -1238,17 +1099,15 @@ def read_sheet_rows(
 
         output_rows.append(
             [
-                account_number,
-                holder,
+                current_account_number,
+                current_account_holder,
                 "",
-                clean_text(
-                    row_data.get("거래명")
-                ),
+                base_transaction,
                 clean_text(
                     row_data.get("종목명")
                 ),
                 parse_date_safe(
-                    row_data.get("거래일자")
+                    row_data.get("거래일")
                 ),
                 float(output_quantity),
                 float(output_unit_price),
@@ -1258,7 +1117,10 @@ def read_sheet_rows(
             ]
         )
 
-    return output_rows, warnings
+    return (
+        output_rows,
+        warnings,
+    )
 
 
 # ============================================================
@@ -1303,6 +1165,57 @@ def autosize_columns(
 
 
 # ============================================================
+# 결과 파일 오류 검사
+# ============================================================
+
+def validate_output_file(
+    file_path: Path,
+) -> None:
+    """
+    저장한 파일을 다시 열어 파일 구조를 확인한다.
+
+    워크시트 XML에 수식 태그가 들어 있으면
+    최종 결과파일로 사용하지 않는다.
+    """
+    with ZipFile(
+        file_path,
+        "r",
+    ) as archive:
+        for member_name in archive.namelist():
+            if not (
+                member_name.startswith(
+                    "xl/worksheets/"
+                )
+                and member_name.endswith(
+                    ".xml"
+                )
+            ):
+                continue
+
+            xml_data = archive.read(
+                member_name
+            )
+
+            if re.search(
+                rb"<f(?:\s|>)",
+                xml_data,
+            ):
+                raise ValueError(
+                    "결과파일에 의도하지 않은 "
+                    "수식이 발견되었습니다: "
+                    f"{member_name}"
+                )
+
+    check_workbook = load_workbook(
+        file_path,
+        data_only=False,
+        read_only=True,
+    )
+
+    check_workbook.close()
+
+
+# ============================================================
 # 결과 파일 저장
 # ============================================================
 
@@ -1312,22 +1225,29 @@ def save_output(
     warnings: List[str],
 ) -> None:
     """
-    임시파일로 저장하고 검증한 뒤
-    최종 결과파일로 교체한다.
+    임시파일에 먼저 저장한 뒤 검증하고,
+    문제가 없을 때만 최종 파일로 교체한다.
     """
-    temporary_path = output_path.with_name(
+    temp_path = output_path.with_name(
         f".{output_path.stem}_작성중.xlsx"
     )
 
-    if temporary_path.exists():
-        temporary_path.unlink()
+    if temp_path.exists():
+        temp_path.unlink()
 
     workbook = Workbook()
 
     worksheet = workbook.active
     worksheet.title = "정리"
 
-    for column_number, header_name in enumerate(
+    # --------------------------------------------------------
+    # 헤더
+    # --------------------------------------------------------
+
+    for (
+        column_number,
+        header_name,
+    ) in enumerate(
         OUTPUT_COLUMNS,
         start=1,
     ):
@@ -1345,11 +1265,24 @@ def save_output(
             bold=True
         )
 
-    for row_number, row_values in enumerate(
+    # --------------------------------------------------------
+    # 데이터
+    # A~E: 문자열
+    # F: 날짜
+    # G~K: 숫자
+    # --------------------------------------------------------
+
+    for (
+        row_number,
+        row_values,
+    ) in enumerate(
         rows,
         start=2,
     ):
-        for column_number, value in enumerate(
+        for (
+            column_number,
+            value,
+        ) in enumerate(
             row_values,
             start=1,
         ):
@@ -1382,15 +1315,9 @@ def save_output(
                 5
             ].number_format = "yyyy-mm-dd"
 
-            # 수량
-            row_cells[6].number_format = "#,##0.00"
-
-            # 매매단가: JPY 엔당 환율 9.xxxx도 확인할 수 있도록
-            # 소수점 넷째 자리까지 표시한다.
-            row_cells[7].number_format = "#,##0.0000"
-
-            # 매매금액 / 수수료 / 세금
             for column_index in (
+                6,
+                7,
                 8,
                 9,
                 10,
@@ -1402,6 +1329,10 @@ def save_output(
     autosize_columns(
         worksheet
     )
+
+    # --------------------------------------------------------
+    # 검토필요 시트
+    # --------------------------------------------------------
 
     if warnings:
         warning_sheet = workbook.create_sheet(
@@ -1422,7 +1353,10 @@ def save_output(
             bold=True
         )
 
-        for row_number, warning_message in enumerate(
+        for (
+            row_number,
+            warning_message,
+        ) in enumerate(
             warnings,
             start=2,
         ):
@@ -1439,23 +1373,22 @@ def save_output(
         ].width = 120
 
     try:
+        # 임시파일 저장
         workbook.save(
-            temporary_path
+            temp_path
         )
 
         workbook.close()
 
-        verification_workbook = load_workbook(
-            temporary_path,
-            data_only=False,
-            read_only=True,
+        # 임시파일 정상 여부 확인
+        validate_output_file(
+            temp_path
         )
 
-        verification_workbook.close()
-
+        # 검증된 임시파일을 최종 결과파일로 교체
         try:
             os.replace(
-                temporary_path,
+                temp_path,
                 output_path,
             )
 
@@ -1463,15 +1396,16 @@ def save_output(
             raise PermissionError(
                 f"'{output_path.name}' 파일이 "
                 "Excel에서 열려 있습니다. "
-                "파일을 완전히 닫고 다시 실행해 주세요."
+                "파일을 완전히 닫은 뒤 "
+                "다시 실행해 주세요."
             ) from error
 
     except Exception:
         workbook.close()
 
-        if temporary_path.exists():
+        if temp_path.exists():
             try:
-                temporary_path.unlink()
+                temp_path.unlink()
 
             except OSError:
                 pass
@@ -1489,33 +1423,15 @@ def main() -> None:
     )
 
     if not input_files:
-        raise FileNotFoundError(
-            f"작업폴더({BASE_DIR})에서 "
-            "입력 파일을 찾지 못했습니다. "
-            f"예상 패턴: {', '.join(INPUT_PATTERNS)}"
-        )
+        raise FileNotFoundError(f"입력폴더에 원본 엑셀이 없습니다: {BASE_DIR}")
 
     exchange_directory = find_exchange_dir(
         BASE_DIR
     )
 
-    if exchange_directory is None:
-        raise FileNotFoundError(
-            f"작업폴더({BASE_DIR}) 안에서 "
-            "exchange_rate 폴더를 찾지 못했습니다. "
-            f"허용 폴더명: "
-            f"{', '.join(EXCHANGE_DIR_NAMES)}"
-        )
-
     fx_tables = load_exchange_rates(
         exchange_directory
     )
-
-    if not fx_tables:
-        raise ValueError(
-            "exchange_rate 폴더에서 사용할 수 있는 "
-            "환율 파일을 찾지 못했습니다."
-        )
 
     for input_file in input_files:
         input_workbook = load_workbook(
@@ -1534,7 +1450,10 @@ def main() -> None:
                     sheet_name
                 ]
 
-                rows, warnings = read_sheet_rows(
+                (
+                    rows,
+                    warnings,
+                ) = read_sheet_rows(
                     worksheet,
                     fx_tables,
                 )
@@ -1550,9 +1469,7 @@ def main() -> None:
         finally:
             input_workbook.close()
 
-        output_path = input_file.with_name(
-            f"{input_file.stem}{OUTPUT_SUFFIX}"
-        )
+        output_path = trade_output_path("한투", input_file)
 
         save_output(
             output_path,

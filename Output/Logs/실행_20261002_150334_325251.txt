@@ -1,0 +1,16 @@
+기간: (datetime.date(2026, 7, 1), datetime.date(2026, 9, 30))
+AP 환율 기준: 파일 내 최신일
+
+[SumAP.py]
+ContractList: C:\Users\pc\OneDrive - 주식회사 플레인바닐라\바탕 화면\공부\일임 보고서\Report\Output\계약\ContractList.xlsx
+AP 폴더: C:\Users\pc\OneDrive - 주식회사 플레인바닐라\바탕 화면\공부\일임 보고서\Report\Output\AP
+사용한 정리 파일:
+  - 삼성: 삼성_AP 및 잔고_정리.xlsx
+  - 교보: 교보_AP 및 잔고_정리.xlsx
+  - KB: KB_AP 및 잔고_정리.xlsx
+  - 한투: 한투_AP 및 잔고_정리.xlsx
+활성 계약 수: 118개
+전체 출력 행 수: 1374개
+10% 초과 출력 행 수: 398개
+검토/제외 행 수: 31개
+완료 파일: C:\Users\pc\OneDrive - 주식회사 플레인바닐라\바탕 화면\공부\일임 보고서\Report\Output\최종\SumAPLIst.xlsx

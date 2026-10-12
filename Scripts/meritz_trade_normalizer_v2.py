@@ -27,28 +27,12 @@ from openpyxl.utils import get_column_letter
 # 환경설정
 # ============================================================
 
-BASE_DIR = Path.cwd()
+from report_paths import trade_input_dir, trade_output_path, exchange_dir, trade_files
+from tax_refunds import is_tax_refund, negative_refund, first_nonzero
 
-INPUT_PATTERNS = [
-    "meritz*.xls",
-    "meritz*.xlsx",
-    "meritz*.xlsm",
-    "MERITZ*.xls",
-    "MERITZ*.xlsx",
-    "MERITZ*.xlsm",
-    "메리츠증권*.xls",
-    "메리츠증권*.xlsx",
-    "메리츠증권*.xlsm",
-    "메리츠*.xls",
-    "메리츠*.xlsx",
-    "메리츠*.xlsm",
-]
+BASE_DIR = trade_input_dir("메리츠")
 
-EXCHANGE_DIR_NAMES = [
-    "exchange_rate",
-    "Exchange_Rate",
-    "EXCHANGE_RATE",
-]
+
 
 OUTPUT_SUFFIX = "_정리.xlsx"
 
@@ -370,40 +354,13 @@ def parse_date_safe(value) -> Optional[date]:
 # 파일 검색
 # ============================================================
 
-def find_exchange_dir(
-    base_dir: Path,
-) -> Optional[Path]:
-    for directory_name in EXCHANGE_DIR_NAMES:
-        directory_path = base_dir / directory_name
-
-        if (
-            directory_path.exists()
-            and directory_path.is_dir()
-        ):
-            return directory_path
-
-    return None
+def find_exchange_dir(base_dir: Path) -> Optional[Path]:
+    path = exchange_dir()
+    return path if path.is_dir() else None
 
 
-def find_input_files(
-    base_dir: Path,
-) -> List[Path]:
-    files: List[Path] = []
-
-    for pattern in INPUT_PATTERNS:
-        files.extend(
-            base_dir.glob(pattern)
-        )
-
-    result = {
-        file_path.resolve()
-        for file_path in files
-        if not file_path.name.startswith("~$")
-        and not file_path.stem.endswith("_정리")
-        and "_작성중" not in file_path.stem
-    }
-
-    return sorted(result)
+def find_input_files(base_dir: Path) -> List[Path]:
+    return trade_files("메리츠")
 
 
 # ============================================================
@@ -759,6 +716,11 @@ def calculate_row(
     currency_code = clean_text(
         row.get("통화구분")
     ).upper()
+
+    if is_tax_refund(transaction):
+        rate = Decimal("1") if "원화" in transaction else get_fx_rate(row, fx_tables)
+        amount = first_nonzero(trade_amount, tax) * rate
+        return [ZERO, ZERO, ZERO, fee * rate, negative_refund(amount)], ""
 
     # ========================================================
     # 해외주식매도대금 / 해외주식매수대금
@@ -1529,20 +1491,14 @@ def main() -> None:
     )
 
     if not input_files:
-        raise FileNotFoundError(
-            f"작업폴더({BASE_DIR})에서 메리츠 원본을 찾지 못했습니다. "
-            f"예상 패턴: {', '.join(INPUT_PATTERNS)}"
-        )
+        raise FileNotFoundError(f"입력폴더에 원본 엑셀이 없습니다: {BASE_DIR}")
 
     exchange_directory = find_exchange_dir(
         BASE_DIR
     )
 
     if exchange_directory is None:
-        raise FileNotFoundError(
-            f"작업폴더({BASE_DIR}) 안에서 exchange_rate 폴더를 "
-            "찾지 못했습니다."
-        )
+        raise FileNotFoundError(f"환율 폴더를 찾지 못했습니다: {exchange_dir()}")
 
     fx_tables = load_exchange_rates(
         exchange_directory
@@ -1560,9 +1516,7 @@ def main() -> None:
             fx_tables,
         )
 
-        output_path = input_file.with_name(
-            f"{input_file.stem}{OUTPUT_SUFFIX}"
-        )
+        output_path = trade_output_path("메리츠", input_file)
 
         save_output(
             output_path,

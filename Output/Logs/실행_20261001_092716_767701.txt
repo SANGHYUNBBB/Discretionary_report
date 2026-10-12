@@ -1,0 +1,4 @@
+기간: (datetime.date(2026, 4, 1), datetime.date(2026, 6, 30))
+AP 환율 기준: 파일 내 최신일
+
+[SumAP.py]

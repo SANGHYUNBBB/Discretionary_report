@@ -4,6 +4,8 @@ import os
 import sys
 from numbers import Number
 
+from report_paths import ap_input_dir, ap_output_dir, exchange_dir, settings, single_ap_input
+
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -52,29 +54,8 @@ def is_cash_record(record):
     return "예수금" in stock_name
 
 
-def find_input_file(base_dir: Path) -> Path:
-    """
-    스크립트가 들어 있는 REPORT/AP 폴더에서 교보 원본 파일을 찾는다.
-    정확한 파일명이 없으면 '교보_AP 및 잔고*.xlsx' 중 정리 파일이 아닌 것을 찾는다.
-    """
-    preferred = base_dir / DEFAULT_INPUT_NAME
-    if preferred.exists():
-        return preferred
-
-    candidates = sorted(
-        path
-        for path in base_dir.glob("교보_AP 및 잔고*.xlsx")
-        if "_정리" not in path.stem
-        and "종목비중" not in path.stem
-        and not path.name.startswith("~$")
-    )
-
-    if not candidates:
-        raise FileNotFoundError(
-            f"교보 원본 엑셀 파일을 찾지 못했습니다.\n확인한 폴더: {base_dir}"
-        )
-
-    return candidates[0]
+def find_input_file(base_dir):
+    return single_ap_input("교보")
 
 
 def find_stock_header_row(ws):
@@ -429,7 +410,8 @@ def create_output_file(records, output_path: Path):
 
 
 def main():
-    base_dir = Path(__file__).resolve().parent
+    base_dir = ap_input_dir("교보")
+    output_dir = ap_output_dir("교보")
 
     # 실행 예시 1:
     #   python kyobo_ap_normalizer_openpyxl_extended_v4_cash_total_weight.py
@@ -451,9 +433,9 @@ def main():
 
     if len(sys.argv) >= 3:
         output_arg = Path(sys.argv[2])
-        output_path = output_arg if output_arg.is_absolute() else base_dir / output_arg
+        output_path = output_arg if output_arg.is_absolute() else output_dir / output_arg
     else:
-        output_path = base_dir / DEFAULT_OUTPUT_NAME
+        output_path = output_dir / DEFAULT_OUTPUT_NAME
 
     records = extract_records(input_path)
     over_10_count = create_output_file(records, output_path)

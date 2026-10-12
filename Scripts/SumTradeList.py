@@ -7,6 +7,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from report_paths import ROOT, final_dir, contract_output, contract_sheet, period, normalized_trade_files
+
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -20,17 +22,14 @@ from openpyxl.utils.datetime import from_excel
 
 # 이 .py 파일이 있는 폴더를 작업폴더로 사용한다.
 # 따라서 폴더 전체를 다른 위치로 옮겨도 정상 작동한다.
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = ROOT
 
 OUTPUT_FILE_NAME = "SumTradeList.xlsx"
 
 # 출력 시트명, 입력 파일 기본 이름
 SOURCE_CONFIG: Sequence[Tuple[str, str]] = (
-    ("삼성", "samsung26q2_정리"),
-    ("메리츠", "Meritz26q2_정리"),
-    ("KB", "kb26q2_정리"),
-    ("교보", "kyobo26q2_정리"),
-    ("한국투자", "han26q2_정리"),
+    ("삼성", "삼성"), ("메리츠", "메리츠"), ("KB", "KB"),
+    ("교보", "교보"), ("한국투자", "한투"),
 )
 
 CONTRACT_FILE_STEMS = {
@@ -329,40 +328,14 @@ def parse_date_value(value) -> Optional[date]:
 # ============================================================
 
 def workbook_candidates() -> List[Path]:
-    result: List[Path] = []
-    for path in BASE_DIR.iterdir():
-        if not path.is_file():
-            continue
-        if path.name.startswith("~$"):
-            continue
-        if path.suffix.lower() not in {".xlsx", ".xlsm"}:
-            continue
-        result.append(path)
-    return result
+    return [contract_output()]
 
 
 def find_contract_file(files: Sequence[Path]) -> Path:
-    exact_matches = [
-        path
-        for path in files
-        if path.stem.casefold() in CONTRACT_FILE_STEMS
-    ]
-
-    if exact_matches:
-        return sorted(exact_matches, key=lambda p: p.stat().st_mtime, reverse=True)[0]
-
-    partial_matches = [
-        path
-        for path in files
-        if "contractlist" in path.stem.casefold()
-    ]
-
-    if partial_matches:
-        return sorted(partial_matches, key=lambda p: p.stat().st_mtime, reverse=True)[0]
-
-    raise FileNotFoundError(
-        f"작업폴더에서 ContractList.xlsx를 찾지 못했습니다: {BASE_DIR}"
-    )
+    path = contract_output()
+    if not path.exists():
+        raise FileNotFoundError("먼저 contract_report_list.py로 Output/계약/ContractList.xlsx를 생성하세요.")
+    return path
 
 
 def find_source_file(files: Sequence[Path], base_stem: str) -> Path:
@@ -484,8 +457,8 @@ def load_active_contracts(
     target_sheet_count = 0
 
     try:
-        for worksheet in workbook.worksheets:
-            # 보고서 대상 정리 시트만 읽는다.
+        for worksheet in [contract_sheet(workbook)]:
+            # 설정한 보고서 종료일의 정리 시트만 읽는다.
             # 원본 상품별 시트에는 D열 보고서작성기준일 헤더가 없으므로 제외된다.
             if normalize_header(worksheet.cell(1, 4).value) not in REPORT_START_HEADER_KEYS:
                 continue
@@ -571,6 +544,7 @@ def read_filtered_rows(
     headers: Optional[List] = None
     filtered_rows: List[List] = []
     matched_accounts: Set[Tuple[str, str]] = set()
+    report_end = period()[1]
 
     workbook = load_workbook(source_file, data_only=True, read_only=False)
     try:
@@ -672,7 +646,7 @@ def read_filtered_rows(
 
                 # 보고서작성기준일 이전 거래는 제외한다.
                 # 기준일 당일 거래는 포함한다.
-                if trade_date < report_start_date:
+                if trade_date < report_start_date or trade_date > report_end:
                     continue
 
                 row_values = [
@@ -844,21 +818,25 @@ def main() -> None:
     all_matched_accounts: Set[Tuple[str, str]] = set()
 
     for sheet_name, base_stem in SOURCE_CONFIG:
-        source_file = find_source_file(files, base_stem)
-        headers, rows, matched_accounts = read_filtered_rows(
-            source_file,
-            active_contracts,
-        )
+        source_files = normalized_trade_files(base_stem)
+        headers, rows, matched_accounts = None, [], set()
+        for source_file in source_files:
+            current_headers, current_rows, current_accounts = read_filtered_rows(source_file, active_contracts)
+            if headers is not None and current_headers != headers:
+                raise ValueError(f"{base_stem} 정리 파일의 열 구성이 서로 다릅니다.")
+            headers = current_headers
+            rows.extend(current_rows)
+            matched_accounts.update(current_accounts)
 
         source_results.append((sheet_name, headers, rows))
         all_matched_accounts.update(matched_accounts)
 
         print(
-            f"[{sheet_name}] {source_file.name} -> "
+            f"[{sheet_name}] {len(source_files)}개 파일 -> "
             f"거래 {len(rows):,}건 / 계약 {len(matched_accounts):,}개"
         )
 
-    output_path = BASE_DIR / OUTPUT_FILE_NAME
+    output_path = final_dir() / OUTPUT_FILE_NAME
     build_output(output_path, source_results)
 
     unmatched_count = len(set(active_contracts) - all_matched_accounts)
