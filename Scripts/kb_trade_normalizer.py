@@ -19,24 +19,12 @@ from openpyxl.utils import get_column_letter
 # 환경설정
 # ============================================================
 
-BASE_DIR = Path.cwd()
+from report_paths import trade_input_dir, trade_output_path, exchange_dir, trade_files
+from tax_refunds import is_tax_refund, negative_refund, first_nonzero
 
-INPUT_PATTERNS = [
-    "kb26q2*.xlsx",
-    "kb26q2*.xlsm",
-    "KB26q2*.xlsx",
-    "KB26q2*.xlsm",
-    "KB거래내역*.xlsx",
-    "KB거래내역*.xlsm",
-    "kb거래내역*.xlsx",
-    "kb거래내역*.xlsm",
-]
+BASE_DIR = trade_input_dir("KB")
 
-EXCHANGE_DIR_NAMES = [
-    "exchange_rate",
-    "Exchange_Rate",
-    "EXCHANGE_RATE",
-]
+
 
 OUTPUT_SUFFIX = "_정리.xlsx"
 
@@ -250,57 +238,32 @@ def extract_account_info(
 # 파일 및 폴더 검색
 # ============================================================
 
-def find_exchange_dir(
-    base_dir: Path,
-) -> Optional[Path]:
-    for directory_name in EXCHANGE_DIR_NAMES:
-        directory_path = base_dir / directory_name
-
-        if (
-            directory_path.exists()
-            and directory_path.is_dir()
-        ):
-            return directory_path
-
-    return None
+def find_exchange_dir(base_dir: Path) -> Optional[Path]:
+    path = exchange_dir()
+    return path if path.is_dir() else None
 
 
-def find_input_files(
-    base_dir: Path,
-) -> List[Path]:
-    """
-    KB 원본 파일만 찾는다.
-    정리 결과, 임시파일, Excel 잠금 파일은 제외한다.
-    """
-    files: List[Path] = []
-
-    for pattern in INPUT_PATTERNS:
-        files.extend(
-            base_dir.glob(pattern)
-        )
-
-    result = {
-        file_path.resolve()
-        for file_path in files
-        if not file_path.name.startswith("~$")
-        and not file_path.stem.endswith("_정리")
-        and "_작성중" not in file_path.stem
-    }
-
-    return sorted(result)
+def find_input_files(base_dir: Path) -> List[Path]:
+    return trade_files("KB")
 
 
 # ============================================================
 # 환율 처리
 # ============================================================
 
-def adjust_fx_rate(
+def adjust_folder_fx_rate(
     currency_code: str,
     rate: Decimal,
 ) -> Decimal:
     """
-    JPY 환율은 100엔당 환율이므로
-    100으로 나누어 1엔당 환율로 바꾼다.
+    exchange_rate 폴더에서 읽은 환율을
+    실제 계산에 사용할 1통화 단위 환율로 변환한다.
+
+    중요:
+    - KB 원본 파일의 JPY 환율은 이미 1엔당 환율(예: 9.xxxx)이므로
+      이 함수에 넣지 않고 그대로 사용한다.
+    - exchange_rate 폴더의 JPY 환율만 100엔당 환율(예: 8xx~9xx)이므로
+      100으로 나누어 1엔당 환율로 변환한다.
     """
     currency_code = clean_text(
         currency_code
@@ -480,16 +443,15 @@ def get_effective_rate(
     환율 적용 순서:
 
     1순위:
-    원본 KB 파일의 환율 값이 있고 0이 아니면 해당 값 사용
+    원본 KB 파일의 환율 값이 있고 0이 아니면 해당 값을 그대로 사용한다.
+    - JPY도 KB 원본은 이미 1엔당 환율(예: 9.xxxx)이므로 그대로 사용한다.
 
     2순위:
-    원본 환율이 공란 또는 0이면 exchange_rate 폴더에서 조회
+    원본 환율이 공란 또는 0이면 exchange_rate 폴더에서 조회한다.
     - 통화구분과 동일한 환율 파일 사용
     - 거래일과 같은 날짜 우선
     - 같은 날짜가 없으면 가장 가까운 이전 날짜 사용
-
-    JPY:
-    원본 환율이든 폴더 환율이든 최종적으로 100으로 나눈다.
+    - 폴더의 JPY 환율은 100엔당 환율이므로 100으로 나눈다.
     """
     currency_code = clean_text(
         row.get("통화구분")
@@ -507,10 +469,9 @@ def get_effective_rate(
     )
 
     if original_rate != ZERO:
-        return adjust_fx_rate(
-            currency_code,
-            original_rate,
-        )
+        # KB 원본 환율은 통화와 관계없이 그대로 사용한다.
+        # 특히 JPY는 이미 1엔당 환율(약 8~10원)이다.
+        return original_rate
 
     # 2순위: exchange_rate 폴더 환율
     trade_date = parse_date_safe(
@@ -547,7 +508,7 @@ def get_effective_rate(
         trade_date
     )
 
-    return adjust_fx_rate(
+    return adjust_folder_fx_rate(
         currency_code,
         folder_rate,
     )
@@ -753,6 +714,16 @@ def calculate_row(
     transaction_tax = to_decimal(
         row.get("거래세 등")
     )
+
+    if is_tax_refund(transaction):
+        if currency_code in ("", "KRW"):
+            amount = first_nonzero(trade_amount, settlement_amount, full_tax_sum(row))
+        elif foreign_settlement_amount:
+            amount = foreign_settlement_amount * get_effective_rate(row, fx_tables)
+        else:
+            # 정산금액/원화 세금 열에는 다시 환율을 곱하지 않는다.
+            amount = first_nonzero(settlement_amount, trade_amount, full_tax_sum(row))
+        return ZERO, ZERO, ZERO, domestic_fee, negative_refund(amount), ""
 
     # ========================================================
     # 매수 / 매도
@@ -1405,9 +1376,10 @@ def save_output(
                 5
             ].number_format = "yyyy-mm-dd"
 
+            # 수량(G), 매매금액(I), 수수료(J), 세금(K)
+            # 은 소수 둘째 자리까지 표시한다.
             for column_index in (
                 6,
-                7,
                 8,
                 9,
                 10,
@@ -1415,6 +1387,11 @@ def save_output(
                 row_cells[
                     column_index
                 ].number_format = "#,##0.00"
+
+            # 매매단가(H)는 외화매수·외화매도에서 환율이 들어가므로
+            # JPY 1엔당 환율(예: 9.xxxx)을 확인할 수 있게
+            # 소수 넷째 자리까지 표시한다.
+            row_cells[7].number_format = "#,##0.0000"
 
     autosize_columns(
         worksheet
@@ -1509,11 +1486,7 @@ def main() -> None:
     )
 
     if not input_files:
-        raise FileNotFoundError(
-            f"작업폴더({BASE_DIR})에서 "
-            "입력 파일을 찾지 못했습니다. "
-            f"예상 패턴: {', '.join(INPUT_PATTERNS)}"
-        )
+        raise FileNotFoundError(f"입력폴더에 원본 엑셀이 없습니다: {BASE_DIR}")
 
     exchange_directory = find_exchange_dir(
         BASE_DIR
@@ -1558,9 +1531,7 @@ def main() -> None:
         finally:
             input_workbook.close()
 
-        output_path = input_file.with_name(
-            f"{input_file.stem}{OUTPUT_SUFFIX}"
-        )
+        output_path = trade_output_path("KB", input_file)
 
         save_output(
             output_path,

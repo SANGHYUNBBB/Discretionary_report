@@ -7,10 +7,13 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from report_paths import ROOT, final_dir, contract_output, contract_sheet, period, normalized_trade_files
+
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.datetime import from_excel
 
 
 # ============================================================
@@ -19,17 +22,14 @@ from openpyxl.utils import get_column_letter
 
 # 이 .py 파일이 있는 폴더를 작업폴더로 사용한다.
 # 따라서 폴더 전체를 다른 위치로 옮겨도 정상 작동한다.
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = ROOT
 
 OUTPUT_FILE_NAME = "SumTradeList.xlsx"
 
 # 출력 시트명, 입력 파일 기본 이름
 SOURCE_CONFIG: Sequence[Tuple[str, str]] = (
-    ("삼성", "samsung26q2_정리"),
-    ("메리츠", "Meritz26q2_정리"),
-    ("KB", "kb26q2_정리"),
-    ("교보", "kyobo26q2_정리"),
-    ("한국투자", "han26q2_정리"),
+    ("삼성", "삼성"), ("메리츠", "메리츠"), ("KB", "KB"),
+    ("교보", "교보"), ("한국투자", "한투"),
 )
 
 CONTRACT_FILE_STEMS = {
@@ -44,6 +44,30 @@ ACCOUNT_HEADER_ALIASES = {
     "증권 계좌번호",
     "위탁계좌번호",
     "위탁 계좌번호",
+}
+
+# 증권사별 거래 정리 파일에서 거래일을 찾을 때 사용할 헤더명
+TRADE_DATE_HEADER_ALIASES = {
+    "거래일자",
+    "거래 일자",
+    "거래일",
+    "거래 일",
+    "매매일자",
+    "매매 일자",
+    "매매일",
+    "매매 일",
+    "체결일자",
+    "체결 일자",
+    "체결일",
+    "체결 일",
+    "처리일자",
+    "처리 일자",
+    "처리일",
+    "처리 일",
+    "거래일시",
+    "거래 일시",
+    "체결일시",
+    "체결 일시",
 }
 
 CONTRACT_STATUS_HEADER_ALIASES = {
@@ -91,6 +115,13 @@ CONTRACT_NAME_HEADER_ALIASES = {
     "이름",
 }
 
+REPORT_START_HEADER_ALIASES = {
+    "보고서작성기준일",
+    "보고서 작성 기준일",
+    "보고서기준일",
+    "보고서 기준일",
+}
+
 # 해당 단어가 계약상태에 포함되면 살아있는 계약에서 제외한다.
 INACTIVE_STATUS_KEYWORDS = {
     "해지",
@@ -130,10 +161,12 @@ def normalized_aliases(values: Iterable[str]) -> Set[str]:
 
 
 ACCOUNT_HEADER_KEYS = normalized_aliases(ACCOUNT_HEADER_ALIASES)
+TRADE_DATE_HEADER_KEYS = normalized_aliases(TRADE_DATE_HEADER_ALIASES)
 STATUS_HEADER_KEYS = normalized_aliases(CONTRACT_STATUS_HEADER_ALIASES)
 PRODUCT_HEADER_KEYS = normalized_aliases(PRODUCT_HEADER_ALIASES)
 PF_HEADER_KEYS = normalized_aliases(PF_HEADER_ALIASES)
 CONTRACT_NAME_HEADER_KEYS = normalized_aliases(CONTRACT_NAME_HEADER_ALIASES)
+REPORT_START_HEADER_KEYS = normalized_aliases(REPORT_START_HEADER_ALIASES)
 
 
 def normalize_account(value) -> str:
@@ -184,45 +217,125 @@ def is_inactive_contract(status_value) -> bool:
     return any(keyword.casefold() in status for keyword in INACTIVE_STATUS_KEYWORDS)
 
 
+def parse_date_value(value) -> Optional[date]:
+    """Excel 날짜, 날짜 문자열, 숫자형 날짜를 date로 변환한다."""
+    if value is None or isinstance(value, bool):
+        return None
+
+    if isinstance(value, datetime):
+        return value.date()
+
+    if isinstance(value, date):
+        return value
+
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+
+        numeric_value = float(value)
+        integer_value = int(numeric_value)
+
+        # 20260401 같은 YYYYMMDD 숫자형 날짜
+        if numeric_value == integer_value and 19000101 <= integer_value <= 99991231:
+            try:
+                return datetime.strptime(str(integer_value), "%Y%m%d").date()
+            except ValueError:
+                return None
+
+        # 일반적인 Excel 일련번호 날짜
+        try:
+            converted = from_excel(numeric_value)
+            if isinstance(converted, datetime):
+                return converted.date()
+            if isinstance(converted, date):
+                return converted
+        except (OverflowError, TypeError, ValueError):
+            return None
+
+        return None
+
+    text = clean_text(value)
+    if not text:
+        return None
+
+    if text.startswith("'"):
+        text = text[1:].strip()
+
+    # ISO 형식에 시간이 함께 있는 경우까지 처리
+    try:
+        return datetime.fromisoformat(text).date()
+    except ValueError:
+        pass
+
+    separated_formats = (
+        (r"\d{4}-\d{1,2}-\d{1,2}", "%Y-%m-%d"),
+        (r"\d{4}\.\d{1,2}\.\d{1,2}", "%Y.%m.%d"),
+        (r"\d{4}/\d{1,2}/\d{1,2}", "%Y/%m/%d"),
+        (r"\d{2}-\d{1,2}-\d{1,2}", "%y-%m-%d"),
+        (r"\d{2}\.\d{1,2}\.\d{1,2}", "%y.%m.%d"),
+        (r"\d{2}/\d{1,2}/\d{1,2}", "%y/%m/%d"),
+    )
+    for pattern, date_format in separated_formats:
+        if not re.fullmatch(pattern, text):
+            continue
+        try:
+            return datetime.strptime(text, date_format).date()
+        except ValueError:
+            return None
+
+    if re.fullmatch(r"\d{8}", text):
+        try:
+            return datetime.strptime(text, "%Y%m%d").date()
+        except ValueError:
+            return None
+
+    if re.fullmatch(r"\d{6}", text):
+        try:
+            return datetime.strptime(text, "%y%m%d").date()
+        except ValueError:
+            return None
+
+    korean_match = re.fullmatch(
+        r"(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일?",
+        text,
+    )
+    if korean_match:
+        try:
+            return date(
+                int(korean_match.group(1)),
+                int(korean_match.group(2)),
+                int(korean_match.group(3)),
+            )
+        except ValueError:
+            return None
+
+    # 문자열로 저장된 Excel 일련번호
+    if re.fullmatch(r"\d+(?:\.0+)?", text):
+        try:
+            converted = from_excel(float(text))
+            if isinstance(converted, datetime):
+                return converted.date()
+            if isinstance(converted, date):
+                return converted
+        except (OverflowError, TypeError, ValueError):
+            return None
+
+    return None
+
+
 # ============================================================
 # 파일 찾기
 # ============================================================
 
 def workbook_candidates() -> List[Path]:
-    result: List[Path] = []
-    for path in BASE_DIR.iterdir():
-        if not path.is_file():
-            continue
-        if path.name.startswith("~$"):
-            continue
-        if path.suffix.lower() not in {".xlsx", ".xlsm"}:
-            continue
-        result.append(path)
-    return result
+    return [contract_output()]
 
 
 def find_contract_file(files: Sequence[Path]) -> Path:
-    exact_matches = [
-        path
-        for path in files
-        if path.stem.casefold() in CONTRACT_FILE_STEMS
-    ]
-
-    if exact_matches:
-        return sorted(exact_matches, key=lambda p: p.stat().st_mtime, reverse=True)[0]
-
-    partial_matches = [
-        path
-        for path in files
-        if "contractlist" in path.stem.casefold()
-    ]
-
-    if partial_matches:
-        return sorted(partial_matches, key=lambda p: p.stat().st_mtime, reverse=True)[0]
-
-    raise FileNotFoundError(
-        f"작업폴더에서 ContractList.xlsx를 찾지 못했습니다: {BASE_DIR}"
-    )
+    path = contract_output()
+    if not path.exists():
+        raise FileNotFoundError("먼저 contract_report_list.py로 Output/계약/ContractList.xlsx를 생성하세요.")
+    return path
 
 
 def find_source_file(files: Sequence[Path], base_stem: str) -> Path:
@@ -319,41 +432,45 @@ def infer_product_from_sheet_name(sheet_name: str) -> str:
     return name
 
 
-def load_active_contracts(contract_file: Path) -> Dict[Tuple[str, str], str]:
+def load_active_contracts(
+    contract_file: Path,
+) -> Dict[Tuple[str, str], Tuple[str, date]]:
     """
-    ContractList.xlsx의 A/B/C열을 직접 읽는다.
+    ContractList.xlsx의 A/B/C/D열을 직접 읽는다.
 
       A열: 상품명
       B열: 이름
       C열: 계좌번호
+      D열: 보고서작성기준일
 
     반환값:
-      {(정규화 계좌번호, 정규화 이름): 상품명}
+      {(정규화 계좌번호, 정규화 이름): (상품명, 보고서작성기준일)}
 
     중요:
     - A열 상품명이 병합셀 또는 그룹별 1회만 입력된 경우를 고려해
       위쪽의 마지막 상품명을 아래 행으로 자동 이어받는다.
-    - 같은 계좌번호+이름 조합이 여러 번 나오더라도,
-      빈 상품명이 기존의 정상 상품명을 덮어쓰지 못하게 한다.
+    - D열 보고서작성기준일부터의 거래만 최종 결과에 포함한다.
     """
-    active_contracts: Dict[Tuple[str, str], str] = {}
+    active_contracts: Dict[Tuple[str, str], Tuple[str, date]] = {}
 
     workbook = load_workbook(contract_file, data_only=True, read_only=False)
+    target_sheet_count = 0
+
     try:
-        for worksheet in workbook.worksheets:
+        for worksheet in [contract_sheet(workbook)]:
+            # 설정한 보고서 종료일의 정리 시트만 읽는다.
+            # 원본 상품별 시트에는 D열 보고서작성기준일 헤더가 없으므로 제외된다.
+            if normalize_header(worksheet.cell(1, 4).value) not in REPORT_START_HEADER_KEYS:
+                continue
+
+            target_sheet_count += 1
             last_product_name = ""
 
-            for row_number in range(1, worksheet.max_row + 1):
+            for row_number in range(2, worksheet.max_row + 1):
                 raw_product = worksheet.cell(row_number, 1).value
                 raw_name = worksheet.cell(row_number, 2).value
                 raw_account = worksheet.cell(row_number, 3).value
-
-                # A/B/C 헤더행 제외
-                if (
-                    normalize_header(raw_name) in CONTRACT_NAME_HEADER_KEYS
-                    and normalize_header(raw_account) in ACCOUNT_HEADER_KEYS
-                ):
-                    continue
+                raw_report_start = worksheet.cell(row_number, 4).value
 
                 current_product_name = clean_text(raw_product)
 
@@ -368,20 +485,39 @@ def load_active_contracts(contract_file: Path) -> Dict[Tuple[str, str], str]:
                 if not account_key or not name_key:
                     continue
 
-                contract_key = (account_key, name_key)
+                report_start_date = parse_date_value(raw_report_start)
+                if report_start_date is None:
+                    raise ValueError(
+                        f"{contract_file.name}의 '{worksheet.title}' 시트 "
+                        f"{row_number}행 D열 보고서작성기준일을 날짜로 읽지 못했습니다. "
+                        f"이름={clean_text(raw_name)}, 계좌번호={clean_text(raw_account)}, "
+                        f"D열 값={clean_text(raw_report_start)}"
+                    )
 
-                # 동일 키가 반복될 때 빈 상품명으로 정상값을 덮어쓰지 않는다.
-                if product_name:
-                    active_contracts[contract_key] = product_name
-                elif contract_key not in active_contracts:
-                    active_contracts[contract_key] = ""
+                if not product_name:
+                    raise ValueError(
+                        f"{contract_file.name}의 '{worksheet.title}' 시트 "
+                        f"{row_number}행 A열 상품명을 찾지 못했습니다. "
+                        f"이름={clean_text(raw_name)}, 계좌번호={clean_text(raw_account)}"
+                    )
+
+                contract_key = (account_key, name_key)
+                active_contracts[contract_key] = (
+                    product_name,
+                    report_start_date,
+                )
     finally:
         workbook.close()
 
+    if target_sheet_count == 0:
+        raise ValueError(
+            f"{contract_file.name}에서 D1이 '보고서작성기준일'인 정리 시트를 찾지 못했습니다."
+        )
+
     if not active_contracts:
         raise ValueError(
-            f"{contract_file.name}의 A/B/C열에서 활성 계약을 찾지 못했습니다. "
-            "A=상품명, B=이름, C=계좌번호인지 확인해 주세요."
+            f"{contract_file.name}의 A/B/C/D열에서 활성 계약을 찾지 못했습니다. "
+            "A=상품명, B=이름, C=계좌번호, D=보고서작성기준일인지 확인해 주세요."
         )
 
     return active_contracts
@@ -393,20 +529,22 @@ def load_active_contracts(contract_file: Path) -> Dict[Tuple[str, str], str]:
 
 def read_filtered_rows(
     source_file: Path,
-    active_contracts: Dict[Tuple[str, str], str],
+    active_contracts: Dict[Tuple[str, str], Tuple[str, date]],
 ) -> Tuple[List, List[List], Set[Tuple[str, str]]]:
     """
     반환값:
       headers        : 출력 헤더
-      filtered_rows  : 살아있는 계약에 해당하는 거래행
-      matched        : 실제로 매칭된 (계좌번호, 이름) 키
+      filtered_rows  : 보고서작성기준일 이후의 거래행
+      matched        : 원본 거래파일에서 실제로 발견된 (계좌번호, 이름) 키
 
     ContractList.xlsx의 A열 상품명을 정리 파일의 PF명 열에 넣는다.
+    ContractList.xlsx의 D열 보고서작성기준일보다 이른 거래는 제외한다.
     원본 정리 파일에 PF명 열이 없으면 계약자명 다음에 새로 만든다.
     """
     headers: Optional[List] = None
     filtered_rows: List[List] = []
     matched_accounts: Set[Tuple[str, str]] = set()
+    report_end = period()[1]
 
     workbook = load_workbook(source_file, data_only=True, read_only=False)
     try:
@@ -421,6 +559,7 @@ def read_filtered_rows(
 
             header_row, header_map = found
             account_column = find_column(header_map, ACCOUNT_HEADER_KEYS)
+            trade_date_column = find_column(header_map, TRADE_DATE_HEADER_KEYS)
             source_pf_column = find_column(header_map, PF_HEADER_KEYS)
             contract_name_column = find_column(
                 header_map,
@@ -433,6 +572,11 @@ def read_filtered_rows(
                 raise ValueError(
                     f"{source_file.name}의 '{worksheet.title}' 시트에서 "
                     "계약자명/이름 열을 찾지 못했습니다."
+                )
+            if trade_date_column is None:
+                raise ValueError(
+                    f"{source_file.name}의 '{worksheet.title}' 시트에서 "
+                    "거래일자/매매일자 열을 찾지 못했습니다."
                 )
 
             last_column = last_nonempty_header_column(worksheet, header_row)
@@ -451,10 +595,7 @@ def read_filtered_rows(
                 insert_pf_column = False
             else:
                 current_headers = list(source_headers)
-                if contract_name_column is not None:
-                    pf_output_index = contract_name_column
-                else:
-                    pf_output_index = account_column
+                pf_output_index = contract_name_column
                 current_headers.insert(pf_output_index, "PF명")
                 insert_pf_column = True
 
@@ -482,6 +623,32 @@ def read_filtered_rows(
                 ):
                     continue
 
+                # 계좌가 원본 거래파일에는 존재했다는 의미이다.
+                # 기준일 이전 거래만 있어도 '미매칭 계약'으로 계산하지 않는다.
+                matched_accounts.add(contract_key)
+
+                product_name, report_start_date = active_contracts[contract_key]
+                product_name = clean_text(product_name)
+
+                raw_trade_date = worksheet.cell(
+                    row_number,
+                    trade_date_column,
+                ).value
+                trade_date = parse_date_value(raw_trade_date)
+
+                if trade_date is None:
+                    raise ValueError(
+                        f"{source_file.name}의 '{worksheet.title}' 시트 "
+                        f"{row_number}행 거래일자를 날짜로 읽지 못했습니다. "
+                        f"이름={clean_text(raw_name)}, 계좌번호={clean_text(raw_account)}, "
+                        f"거래일자 값={clean_text(raw_trade_date)}"
+                    )
+
+                # 보고서작성기준일 이전 거래는 제외한다.
+                # 기준일 당일 거래는 포함한다.
+                if trade_date < report_start_date or trade_date > report_end:
+                    continue
+
                 row_values = [
                     worksheet.cell(row_number, column_number).value
                     for column_number in range(1, last_column + 1)
@@ -490,7 +657,6 @@ def read_filtered_rows(
                 # 계좌번호가 숫자로 저장돼도 결과에서는 일반 텍스트로 저장한다.
                 row_values[account_column - 1] = clean_text(raw_account)
 
-                product_name = clean_text(active_contracts.get(contract_key, ""))
                 if not product_name:
                     raise ValueError(
                         "ContractList.xlsx에서 "
@@ -505,7 +671,6 @@ def read_filtered_rows(
                     row_values[pf_output_index] = product_name
 
                 filtered_rows.append(row_values)
-                matched_accounts.add(contract_key)
     finally:
         workbook.close()
 
@@ -639,7 +804,9 @@ def main() -> None:
     print(f"살아있는 계약 수(계좌번호+이름): {len(active_contracts):,}개")
 
     missing_product_count = sum(
-        1 for product_name in active_contracts.values() if not product_name
+        1
+        for product_name, _report_start_date in active_contracts.values()
+        if not product_name
     )
     if missing_product_count:
         print(
@@ -651,21 +818,25 @@ def main() -> None:
     all_matched_accounts: Set[Tuple[str, str]] = set()
 
     for sheet_name, base_stem in SOURCE_CONFIG:
-        source_file = find_source_file(files, base_stem)
-        headers, rows, matched_accounts = read_filtered_rows(
-            source_file,
-            active_contracts,
-        )
+        source_files = normalized_trade_files(base_stem)
+        headers, rows, matched_accounts = None, [], set()
+        for source_file in source_files:
+            current_headers, current_rows, current_accounts = read_filtered_rows(source_file, active_contracts)
+            if headers is not None and current_headers != headers:
+                raise ValueError(f"{base_stem} 정리 파일의 열 구성이 서로 다릅니다.")
+            headers = current_headers
+            rows.extend(current_rows)
+            matched_accounts.update(current_accounts)
 
         source_results.append((sheet_name, headers, rows))
         all_matched_accounts.update(matched_accounts)
 
         print(
-            f"[{sheet_name}] {source_file.name} -> "
+            f"[{sheet_name}] {len(source_files)}개 파일 -> "
             f"거래 {len(rows):,}건 / 계약 {len(matched_accounts):,}개"
         )
 
-    output_path = BASE_DIR / OUTPUT_FILE_NAME
+    output_path = final_dir() / OUTPUT_FILE_NAME
     build_output(output_path, source_results)
 
     unmatched_count = len(set(active_contracts) - all_matched_accounts)
