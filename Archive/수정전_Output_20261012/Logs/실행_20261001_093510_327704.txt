@@ -1,0 +1,36 @@
+기간: (datetime.date(2026, 7, 1), datetime.date(2026, 9, 30))
+AP 환율 기준: 파일 내 최신일
+
+[samsung_AP_normalizer.py]
+원본 파일: 삼성_AP 및 잔고.xlsx
+환율 폴더: C:\Users\pc\OneDrive - 주식회사 플레인바닐라\바탕 화면\공부\일임 보고서\Report\Input\exchange_rate
+사용 가능 환율: CNY, HKD, JPY, USD
+원본 시트: Sheet1
+생성 계좌 시트 수: 117개
+10% 초과 통합 행 수: 343개
+요약 시트에서 제외한 현금·예수금 행 수: 17개
+완료 파일: C:\Users\pc\OneDrive - 주식회사 플레인바닐라\바탕 화면\공부\일임 보고서\Report\Output\AP\삼성\삼성_AP 및 잔고_정리.xlsx
+
+[han_AP_normalizer.py]
+원본 파일: 한투_AP 및 잔고.xlsx
+전체 행 수: 26개
+예수금 행 수: 5개
+10% 초과 종목 수: 11개
+완료 파일: C:\Users\pc\OneDrive - 주식회사 플레인바닐라\바탕 화면\공부\일임 보고서\Report\Output\AP\한투\한투_AP 및 잔고_정리.xlsx
+
+[kb_AP_normalizer.py]
+원본 파일: KB_AP 및 잔고.xlsx
+환율 폴더: C:\Users\pc\OneDrive - 주식회사 플레인바닐라\바탕 화면\공부\일임 보고서\Report\Input\exchange_rate
+사용 가능 환율: CNY, HKD, JPY, USD
+고객 시트 수: 9개
+전체 행 수: 87개
+예수금 행 수: 18개
+10% 초과 종목 수: 35개
+완료 파일: C:\Users\pc\OneDrive - 주식회사 플레인바닐라\바탕 화면\공부\일임 보고서\Report\Output\AP\KB\KB_AP 및 잔고_정리.xlsx
+
+[kyobo_AP_normalizer.py]
+원본 파일: 교보_AP 및 잔고.xlsx
+전체 행 수: 30개
+예수금 행 수: 6개
+10% 초과 종목 수: 14개
+완료 파일: C:\Users\pc\OneDrive - 주식회사 플레인바닐라\바탕 화면\공부\일임 보고서\Report\Output\AP\교보\교보_AP 및 잔고_정리.xlsx

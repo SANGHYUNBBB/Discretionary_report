@@ -12,6 +12,8 @@ from numbers import Number
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from report_paths import ap_input_dir, ap_output_dir, exchange_dir, settings, single_ap_input
+
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
@@ -22,7 +24,7 @@ SUMMARY_SHEET_NAME = "10%초과_모음"
 
 # None이면 exchange_rate 파일의 가장 최근 날짜 환율을 사용한다.
 # 특정 기준일을 강제로 쓰고 싶으면 예: "2026-06-30"
-EXCHANGE_LOOKUP_DATE = None
+EXCHANGE_LOOKUP_DATE = settings().get("ap_exchange_date")
 
 OUTPUT_HEADERS = [
     "상품",
@@ -204,52 +206,13 @@ def is_cash_or_deposit(stock_name):
 # 파일 및 폴더 검색
 # ============================================================
 
-def find_input_file(base_dir: Path) -> Path:
-    preferred = base_dir / INPUT_FILE_NAME
-    if preferred.exists():
-        return preferred
-
-    candidates = sorted(
-        path
-        for path in base_dir.glob("삼성_AP 및 잔고*.xlsx")
-        if "계좌별정리" not in path.stem
-        and "_정리" not in path.stem
-        and not path.name.startswith("~$")
-    )
-
-    if not candidates:
-        raise FileNotFoundError(
-            f"'{INPUT_FILE_NAME}' 파일을 찾지 못했습니다.\n"
-            f"확인한 폴더: {base_dir}"
-        )
-
-    return candidates[0]
+def find_input_file(base_dir):
+    return single_ap_input("삼성")
 
 
-def find_exchange_dir(base_dir: Path) -> Optional[Path]:
-    """
-    exchange_rate 폴더를 찾는다.
-
-    스크립트가 REPORT/AP 안에 있어도,
-    REPORT/exchange_rate 구조를 자동으로 찾도록 처리한다.
-    """
-    candidates = [
-        base_dir / "exchange_rate",
-        base_dir / "Exchange_Rate",
-        base_dir / "EXCHANGE_RATE",
-        base_dir.parent / "exchange_rate",
-        base_dir.parent / "Exchange_Rate",
-        base_dir.parent / "EXCHANGE_RATE",
-        Path.cwd() / "exchange_rate",
-        Path.cwd() / "Exchange_Rate",
-        Path.cwd() / "EXCHANGE_RATE",
-    ]
-
-    for directory in candidates:
-        if directory.exists() and directory.is_dir():
-            return directory
-
-    return None
+def find_exchange_dir(base_dir):
+    path = exchange_dir()
+    return path if path.is_dir() else None
 
 
 def extract_currency_code_from_filename(file_path: Path) -> str:
@@ -1091,12 +1054,13 @@ def create_output(groups, output_path):
 # ============================================================
 
 def main():
-    base_dir = Path(__file__).resolve().parent
+    base_dir = ap_input_dir("삼성")
+    output_dir = ap_output_dir("삼성")
 
     # 사용법
-    # python samsung_ap_normalizer_openpyxl_extended.py
-    # python samsung_ap_normalizer_openpyxl_extended.py "삼성_AP 및 잔고.xlsx"
-    # python samsung_ap_normalizer_openpyxl_extended.py "원본.xlsx" "결과.xlsx"
+    # python samsung_AP_normalizer.py
+    # python samsung_AP_normalizer.py "삼성_AP 및 잔고.xlsx"
+    # python samsung_AP_normalizer.py "원본.xlsx" "결과.xlsx"
 
     if len(sys.argv) >= 2:
         requested_input = Path(sys.argv[1])
@@ -1118,10 +1082,10 @@ def main():
         output_path = (
             requested_output
             if requested_output.is_absolute()
-            else base_dir / requested_output
+            else output_dir / requested_output
         )
     else:
-        output_path = base_dir / OUTPUT_FILE_NAME
+        output_path = output_dir / OUTPUT_FILE_NAME
 
     exchange_dir = find_exchange_dir(base_dir)
     fx_tables = load_exchange_rates(exchange_dir)

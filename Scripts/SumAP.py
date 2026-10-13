@@ -6,13 +6,16 @@ import os
 import re
 import sys
 
+from report_paths import ROOT, ap_output_dir, final_dir, contract_output, contract_sheet, period
+from datetime import date, datetime
+
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 
 CONTRACT_LIST_NAME = "ContractList.xlsx"
-DEFAULT_OUTPUT_NAME = "SumAPList.xlsx"
+DEFAULT_OUTPUT_NAME = "SumAPLIst.xlsx"
 
 ALL_SHEET_NAME = "전체_내림차순"
 OVER_10_SHEET_NAME = "10%초과"
@@ -72,135 +75,79 @@ def is_cash_or_deposit(stock_name):
 
 
 def locate_dirs():
-    """
-    실행 위치를 자동 판단한다.
-
-    일반 사용:
-    - 이 스크립트가 Report/AP 폴더 안에 있음
-    - ContractList.xlsx는 Report 폴더 안에 있음
-    - 증권사별 정리 파일들은 Report/AP 폴더 안에 있음
-
-    샌드박스나 테스트:
-    - 파일들이 같은 폴더에 있어도 동작
-    """
-    base_dir = Path(__file__).resolve().parent
-
-    if base_dir.name.lower() == "ap":
-        ap_dir = base_dir
-        report_dir = base_dir.parent
-    elif (base_dir / "AP").exists():
-        report_dir = base_dir
-        ap_dir = base_dir / "AP"
-    else:
-        report_dir = base_dir
-        ap_dir = base_dir
-
-    return report_dir, ap_dir
+    return ROOT, ap_output_dir()
 
 
 def find_contract_list(report_dir, ap_dir):
-    candidates = [
-        report_dir / CONTRACT_LIST_NAME,
-        ap_dir / CONTRACT_LIST_NAME,
-    ]
-
-    candidates.extend(sorted(report_dir.glob("ContractList*.xlsx")))
-    candidates.extend(sorted(ap_dir.glob("ContractList*.xlsx")))
-
-    for path in candidates:
-        if path.exists() and not path.name.startswith("~$"):
-            return path
-
-    raise FileNotFoundError(
-        "ContractList.xlsx 파일을 찾지 못했습니다.\n"
-        f"확인한 폴더: {report_dir}, {ap_dir}"
-    )
+    path = contract_output()
+    if not path.exists():
+        raise FileNotFoundError("먼저 contract_report_list.py를 실행하세요.")
+    return path
 
 
 def read_active_contracts(contract_path):
-    """
-    ContractList.xlsx에서 살아있는 계약 목록을 읽는다.
+    """계좌별 모든 작성기간을 보존하고 보고서 종료일의 상품을 우선 선택한다.
 
-    기본 구조:
-    - A열: 상품
-    - B열: 이름
-    - C열: 계좌번호
-
-    이 파일 자체가 살아있는 계약 리스트라는 전제로,
-    데이터가 있는 행 전체를 활성 계약으로 본다.
+    분기 중 종료 계약은 기존 취합 범위를 유지한다. 종료일에 유효한 구간이
+    없으면 가장 최근 작성기간의 상품을 선택하고 AP 기준일 확인을 남긴다.
+    ap_exchange_date는 환율 선택용이므로 계약 선택일로 사용하지 않는다.
     """
     wb = load_workbook(contract_path, data_only=True, read_only=True)
-
+    candidates = defaultdict(list)
+    reviews = []
     try:
-        ws = wb[wb.sheetnames[0]]
-
-        active_by_exact_key = {}
-        active_by_account = defaultdict(list)
-        active_order = []
-        duplicate_contracts = []
-
-        for row_no in range(2, ws.max_row + 1):
-            product = clean_text(ws.cell(row=row_no, column=1).value)
-            name = clean_text(ws.cell(row=row_no, column=2).value)
-            account_no = clean_text(ws.cell(row=row_no, column=3).value)
-
-            if not product and not name and not account_no:
+        ws = contract_sheet(wb)
+        report_start, report_end = period()
+        for row_no, values in enumerate(ws.iter_rows(min_row=2, max_col=5, values_only=True), 2):
+            product, name, account_no = map(clean_text, values[:3])
+            if not any(values):
                 continue
-
-            if not product or not name or not account_no:
-                duplicate_contracts.append([
-                    "ContractList 불완전 행",
-                    row_no,
-                    product,
-                    name,
-                    account_no,
-                    "",
-                ])
+            if not product or not name or not normalize_account(account_no):
+                reviews.append(["ContractList 불완전 행", row_no, product, name, account_no, ""])
                 continue
-
-            account_key = normalize_account(account_no)
-            name_key = normalize_name(name)
-
-            if not account_key or not name_key:
-                duplicate_contracts.append([
-                    "ContractList 키 변환 실패",
-                    row_no,
-                    product,
-                    name,
-                    account_no,
-                    "",
-                ])
-                continue
-
-            exact_key = (account_key, name_key)
-
-            info = {
-                "product": product,
-                "name": name,
-                "account_no": account_no,
-                "order": len(active_order),
-                "source_row": row_no,
-            }
-
-            if exact_key in active_by_exact_key:
-                duplicate_contracts.append([
-                    "ContractList 중복 키",
-                    row_no,
-                    product,
-                    name,
-                    account_no,
-                    f"기존 행: {active_by_exact_key[exact_key]['source_row']}",
-                ])
-                continue
-
-            active_by_exact_key[exact_key] = info
-            active_by_account[account_key].append(info)
-            active_order.append(info)
-
+            start, end = values[3:5]
+            start = start.date() if isinstance(start, datetime) else start
+            end = end.date() if isinstance(end, datetime) else end
+            if not isinstance(start, date) or not isinstance(end, date):
+                raise ValueError(f"계약 결과 {row_no}행의 작성기간을 날짜로 읽지 못했습니다.")
+            if not report_start <= start <= end <= report_end:
+                raise ValueError(f"계약 결과 {row_no}행의 작성기간이 현재 보고서 기간을 벗어납니다.")
+            candidates[(normalize_account(account_no), normalize_name(name))].append({
+                "product": product, "name": name, "account_no": account_no,
+                "source_row": row_no, "start": start, "end": end,
+            })
     finally:
         wb.close()
 
-    return active_by_exact_key, active_by_account, active_order, duplicate_contracts
+    active_by_exact_key = {}
+    active_by_account = defaultdict(list)
+    active_order = []
+    for key, windows in candidates.items():
+        current = [w for w in windows if w["start"] <= report_end <= w["end"]]
+        if current:
+            eligible = current
+        else:
+            latest_end = max(w["end"] for w in windows)
+            eligible = [w for w in windows if w["end"] == latest_end]
+        if len({w["product"] for w in eligible}) > 1:
+            raise ValueError(
+                "같은 계좌/이름의 AP 상품 선택일에 서로 다른 상품의 계약기간이 겹칩니다. "
+                f"계약 결과 행: {[w['source_row'] for w in eligible]}"
+            )
+        selected = dict(max(eligible, key=lambda w: (w["start"], w["source_row"])))
+        selected["order"] = len(active_order)
+        selected["contract_periods"] = windows
+        if not current:
+            reviews.append([
+                "분기 중 종료 계약 AP 기준일 확인", selected["source_row"],
+                selected["product"], selected["name"], selected["account_no"],
+                f"최근 작성기간 {selected['start']}~{selected['end']}. "
+                "AP가 고객별 마감일 자료인지 확인 필요.",
+            ])
+        active_by_exact_key[key] = selected
+        active_by_account[key[0]].append(selected)
+        active_order.append(selected)
+    return active_by_exact_key, active_by_account, active_order, reviews
 
 
 def workbook_quality_score(path, broker):
@@ -308,7 +255,7 @@ def pick_best_file(ap_dir, broker):
     candidates = []
 
     for pattern in patterns[broker]:
-        candidates.extend(ap_dir.glob(pattern))
+        candidates.extend((ap_dir / broker).glob(pattern))
 
     filtered = []
     for path in candidates:
@@ -715,7 +662,7 @@ def write_check_sheet(wb, broker_files, unmatched_rows, active_order, matched_co
     rows.extend(unmatched_rows)
 
     rows.append(["", "", "", "", "", "", "", "", ""])
-    rows.append(["ContractList 중복/불완전 행", "", "", "", "", "", "", "", ""])
+    rows.append(["ContractList 기간 및 불완전 행 검토", "", "", "", "", "", "", "", ""])
     rows.append(["사유", "원본행", "상품", "계약자명", "계좌번호", "비고", "", "", ""])
     rows.extend(duplicate_contracts)
 
@@ -733,7 +680,7 @@ def write_check_sheet(wb, broker_files, unmatched_rows, active_order, matched_co
             "사용한 정리 파일",
             "ContractList에는 있으나 정리 파일에서 발견되지 않은 계약",
             "제외/검토 행",
-            "ContractList 중복/불완전 행",
+            "ContractList 기간 및 불완전 행 검토",
         }:
             for column_no in range(1, 10):
                 cell = ws.cell(row=row_no, column=column_no)
@@ -814,10 +761,10 @@ def main():
         output_path = (
             requested_output
             if requested_output.is_absolute()
-            else report_dir / requested_output
+            else final_dir() / requested_output
         )
     else:
-        output_path = report_dir / DEFAULT_OUTPUT_NAME
+        output_path = final_dir() / DEFAULT_OUTPUT_NAME
 
     contract_path = find_contract_list(report_dir, ap_dir)
 
@@ -858,7 +805,7 @@ def main():
     print("사용한 정리 파일:")
     for broker, path in broker_files.items():
         print(f"  - {broker}: {path.name if path else '찾지 못함'}")
-    print(f"활성 계약 수: {len(active_order)}개")
+    print(f"보고서 대상 계좌 수: {len(active_order)}개")
     print(f"전체 출력 행 수: {len(all_rows)}개")
     print(f"10% 초과 출력 행 수: {len(over_10_rows)}개")
     print(f"검토/제외 행 수: {len(unmatched_rows)}개")

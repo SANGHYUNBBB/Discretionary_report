@@ -1,0 +1,39 @@
+기간: (datetime.date(2026, 7, 1), datetime.date(2026, 9, 30))
+AP 환율 기준: 파일 내 최신일
+
+[contract_report_list.py]
+결과 파일: /workspace/scratch/2a46974b9895/work/Report/Output/계약/ContractList.xlsx
+원본 파일: /workspace/scratch/2a46974b9895/work/Report/Input/계약/ContractList.xlsx
+보고서 기간: 2026-07-01 ~ 2026-09-30
+작성 시트: 260930
+총 작성 대상: 141건
+  - 테크차이나: 56건
+  - 글로벌임펄스: 58건
+  - 일본온앤오프: 14건
+  - 미국온앤오프: 13건
+
+[검토 필요]
+  - [테크차이나 20행] 해지일(2026-06-24)이 계약일(2026-07-11)보다 빠름: 연속 계약 종료일로 반영
+  - [테크차이나 38행] 해지일(2026-03-20)이 계약일(2026-07-23)보다 빠름: 연속 계약 종료일로 반영
+
+[samsung_trade_normalizer.py]
+완료: /workspace/scratch/2a46974b9895/work/Report/Output/거래내역/삼성/samsung26q2_정리.xlsx
+  - 검토필요 건수: 6880
+
+[han_trade_normalizer.py]
+완료: /workspace/scratch/2a46974b9895/work/Report/Output/거래내역/한투/han26q2_정리.xlsx
+  - 검토필요 건수: 63
+
+[kb_trade_normalizer.py]
+완료: /workspace/scratch/2a46974b9895/work/Report/Output/거래내역/KB/kb26q2_정리.xlsx
+  - 검토필요 건수: 412
+
+[kyobo_trade_normalizer.py]
+완료: /workspace/scratch/2a46974b9895/work/Report/Output/거래내역/교보/kyobo26q2_정리.xlsx
+  - 검토필요 건수: 517
+
+[meritz_trade_normalizer_v2.py]
+완료: /workspace/scratch/2a46974b9895/work/Report/Output/거래내역/메리츠/Meritz26q2_정리.xlsx
+  - 검토필요 건수: 57
+
+계산 검증 실패: samsung26q2_정리.xlsx: 계산 실패 6880건으로 취합을 중단합니다. 검토필요 시트와 거래일별 환율 자료를 확인하고 거래 정리를 다시 실행하세요.

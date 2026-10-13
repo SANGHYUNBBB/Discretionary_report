@@ -11,6 +11,8 @@ from numbers import Number
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from report_paths import ap_input_dir, ap_output_dir, exchange_dir, settings, single_ap_input
+
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
@@ -27,7 +29,7 @@ OVER_10_SHEET_NAME = "10%초과"
 
 # None이면 exchange_rate 파일의 가장 최근 날짜 환율을 사용한다.
 # 특정 기준일을 강제로 쓰고 싶으면 예: "2026-06-30"
-EXCHANGE_LOOKUP_DATE = None
+EXCHANGE_LOOKUP_DATE = settings().get("ap_exchange_date")
 
 HEADERS = [
     "상품",
@@ -206,54 +208,13 @@ def is_cash_record(record):
 # 파일 및 폴더 검색
 # ============================================================
 
-def find_input_file(base_dir: Path) -> Path:
-    """
-    스크립트와 같은 AP 폴더에서 KB 원본 파일을 찾는다.
-    '_정리'가 들어간 결과 파일과 엑셀 임시 파일은 제외한다.
-    """
-    preferred = base_dir / INPUT_FILE_NAME
-    if preferred.exists():
-        return preferred
-
-    candidates = sorted(
-        path
-        for path in base_dir.glob("KB_AP 및 잔고*.xlsx")
-        if "_정리" not in path.stem and not path.name.startswith("~$")
-    )
-
-    if not candidates:
-        raise FileNotFoundError(
-            f"'{INPUT_FILE_NAME}' 파일을 찾지 못했습니다.\n"
-            f"확인한 폴더: {base_dir}"
-        )
-
-    return candidates[0]
+def find_input_file(base_dir):
+    return single_ap_input("KB")
 
 
-def find_exchange_dir(base_dir: Path) -> Optional[Path]:
-    """
-    exchange_rate 폴더를 찾는다.
-
-    스크립트가 REPORT/AP 안에 있어도,
-    REPORT/exchange_rate 구조를 자동으로 찾도록 처리한다.
-    """
-    candidates = [
-        base_dir / "exchange_rate",
-        base_dir / "Exchange_Rate",
-        base_dir / "EXCHANGE_RATE",
-        base_dir.parent / "exchange_rate",
-        base_dir.parent / "Exchange_Rate",
-        base_dir.parent / "EXCHANGE_RATE",
-        Path.cwd() / "exchange_rate",
-        Path.cwd() / "Exchange_Rate",
-        Path.cwd() / "EXCHANGE_RATE",
-    ]
-
-    for directory in candidates:
-        if directory.exists() and directory.is_dir():
-            return directory
-
-    return None
+def find_exchange_dir(base_dir):
+    path = exchange_dir()
+    return path if path.is_dir() else None
 
 
 def extract_currency_code_from_filename(file_path: Path) -> str:
@@ -981,12 +942,13 @@ def create_output_workbook(records, output_path: Path):
 
 
 def main():
-    base_dir = Path(__file__).resolve().parent
+    base_dir = ap_input_dir("KB")
+    output_dir = ap_output_dir("KB")
 
     # 사용법
-    # python kb_ap_normalizer_openpyxl_extended.py
-    # python kb_ap_normalizer_openpyxl_extended.py "KB_AP 및 잔고.xlsx"
-    # python kb_ap_normalizer_openpyxl_extended.py "원본.xlsx" "결과.xlsx"
+    # python kb_AP_normalizer.py
+    # python kb_AP_normalizer.py "KB_AP 및 잔고.xlsx"
+    # python kb_AP_normalizer.py "원본.xlsx" "결과.xlsx"
     if len(sys.argv) >= 2:
         requested_input = Path(sys.argv[1])
         input_path = (
@@ -1007,10 +969,10 @@ def main():
         output_path = (
             requested_output
             if requested_output.is_absolute()
-            else base_dir / requested_output
+            else output_dir / requested_output
         )
     else:
-        output_path = base_dir / OUTPUT_FILE_NAME
+        output_path = output_dir / OUTPUT_FILE_NAME
 
     exchange_dir = find_exchange_dir(base_dir)
     fx_tables = load_exchange_rates(exchange_dir)
